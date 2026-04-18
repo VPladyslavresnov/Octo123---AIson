@@ -1,0 +1,1 @@
+ALTER TABLE public.company_details ADD COLUMN IF NOT EXISTS preferred_model TEXT DEFAULT NULL;
