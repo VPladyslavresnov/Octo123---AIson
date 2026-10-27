@@ -24,11 +24,16 @@ dist-ssr
 *.sw?
 .supabase-db-password
 
+# Environment (secrets / per-machine config) — use .env.example as the template
+.env
+
 # Local tooling, deploy caches, and heavy artifacts (not part of the app source)
 .firebase/
 .netlify/
 .streamlit/
 .agents/
 .claude/
-onprem-demo/.venv/
-onprem-demo/.streamlit/
+skills-lock.json
+
+# Separate project — the GMS on-prem analysis agent lives in its own repo
+onprem-demo/
