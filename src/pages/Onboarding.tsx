@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
 import { toast } from "sonner";
 import { motion, AnimatePresence } from "framer-motion";
+import { Confetti } from "@/components/Confetti";
 import {
   Instagram,
   ArrowRight,
@@ -24,6 +25,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card } from "@/components/ui/card";
+import { getBypassRedirectTarget } from "@/lib/localAccessBypass";
 
 type Step = "data" | "questionnaire" | "profile" | "welcome";
 
@@ -82,6 +84,15 @@ export default function Onboarding() {
     if (savedIg) { setInstagramHandle(savedIg); sessionStorage.removeItem("onboarding_ig"); }
   }, []);
 
+  // If the user already has a brand, they've onboarded — send them to the app.
+  useEffect(() => {
+    supabase.auth.getSession().then(async ({ data: { session } }) => {
+      if (!session) return;
+      const { data } = await supabase.from("brand_profiles").select("id").eq("user_id", session.user.id).limit(1);
+      if (data && data.length) navigate("/home", { replace: true });
+    });
+  }, [navigate]);
+
   const toggleGoal = (g: string) => {
     setSelectedGoals((prev) =>
       prev.includes(g) ? prev.filter((x) => x !== g) : [...prev, g]
@@ -102,7 +113,7 @@ export default function Onboarding() {
     if (!session) {
       sessionStorage.setItem("onboarding_desc", businessDesc);
       sessionStorage.setItem("onboarding_ig", instagramHandle);
-      navigate("/auth?redirect=/onboarding");
+      navigate(`${getBypassRedirectTarget()}?redirect=/onboarding`);
       return;
     }
 
@@ -127,14 +138,50 @@ export default function Onboarding() {
 
       setScanStage("learning");
 
-      // Trigger brand intelligence scan if URL available
+      // Trigger brand intelligence scan if URL available → builds the brand profile.
+      let newBrandId: string | null = null;
       if (brandSourceUrl) {
-        await supabase.functions.invoke("brand-intelligence", {
-          body: { url: brandSourceUrl },
+        const { data: scan } = await supabase.functions.invoke("brand-intelligence", {
+          body: { url: brandSourceUrl, force_refresh: true },
         });
+        newBrandId = scan?.data?.id || null;
       }
 
+      // If no scan (or no URL), create a manual brand from the questionnaire so
+      // the account always has a brand after onboarding.
+      if (!newBrandId) {
+        const { data: manual } = await supabase.from("brand_profiles").insert({
+          user_id: session.user.id,
+          source_url: `manual:${crypto.randomUUID()}`,
+          is_manual: true,
+          brand_name: extractName(businessDesc),
+          industry: selectedIndustry || extractIndustry(businessDesc),
+          target_audience_signals: targetAudience || undefined,
+          location: selectedRegion || undefined,
+          website: websiteUrl.trim() || undefined,
+        } as any).select("id").single();
+        newBrandId = (manual as any)?.id || null;
+      }
+
+      // Make the new brand the account's ACTIVE brand.
+      if (newBrandId) {
+        await (supabase.from("profiles").update({ active_brand_id: newBrandId }).eq("id", session.user.id) as any);
+      }
+
+      // Kick off the competitor/strategy report in the BACKGROUND so the account
+      // is fully understood by the time they start (don't make them wait for it).
+      const brandName = extractName(businessDesc);
+      const goalText = selectedGoals.length ? ` Goals: ${selectedGoals.join(", ")}.` : "";
+      void supabase.functions.invoke("generate-strategy-prompt", {
+        body: {
+          sourcePrompt: `Grow ${brandName}. ${businessDesc}.${goalText} Target audience: ${targetAudience || "their core customers"}. Industry: ${selectedIndustry || extractIndustry(businessDesc)}.`,
+          requestedContentType: "image",
+        },
+      }).catch(() => { /* non-blocking */ });
+
       setScanStage("done");
+      // Reward: finishing onboarding unlocks the "Brand Builder" star.
+      window.dispatchEvent(new Event("aison:brand-ready"));
       await new Promise((r) => setTimeout(r, 1200));
       setStep("welcome");
     } catch {
@@ -147,8 +194,37 @@ export default function Onboarding() {
 
   const stepNumber = step === "data" ? 1 : step === "questionnaire" ? 2 : step === "profile" ? 3 : 4;
 
+  const mascotGuide =
+    step === "data" ? "Tell me about your business — the more detail, the better content I'll make! ✨"
+      : step === "questionnaire" ? "A few quick picks so I nail your vibe 🎯"
+        : step === "profile" ? "Building your brand… one sec! ⚙️"
+          : "Woohoo — you're all set! 🎉";
+
   return (
     <div className="min-h-screen bg-[#0A0F1E] relative overflow-hidden flex flex-col">
+      {/* Celebration on completion */}
+      <Confetti fire={step === "welcome"} />
+
+      {/* Guide mascot — points you through the form, celebrates at the end */}
+      <div className="hidden lg:flex fixed left-8 bottom-8 z-30 items-end gap-3 pointer-events-none">
+        <img
+          src={step === "questionnaire" ? "/mascot/mascot-3q.png" : "/mascot/mascot-wave.png"}
+          alt="Aison mascot"
+          className={`w-32 h-32 object-contain drop-shadow-[0_12px_26px_rgba(234,67,6,0.4)] ${step === "welcome" ? "ob-jump" : "ob-bob"}`}
+        />
+        <div className="mb-12 max-w-[230px] rounded-2xl rounded-bl-sm bg-white/[0.07] border border-white/10 px-3.5 py-2.5 text-sm text-white shadow-xl backdrop-blur-sm ob-bubble">
+          {mascotGuide}
+        </div>
+      </div>
+      <style>{`
+        @keyframes ob-bob{0%,100%{transform:translateY(0) rotate(-1.5deg)}50%{transform:translateY(-8px) rotate(1.5deg)}}
+        @keyframes ob-jump{0%{transform:translateY(0) scaleX(1) scaleY(1)}14%{transform:translateY(0) scaleX(1.12) scaleY(.86)}38%{transform:translateY(-38px) scaleX(.92) scaleY(1.12) rotate(-6deg)}58%{transform:translateY(-32px) scaleX(.97) scaleY(1.05) rotate(6deg)}80%{transform:translateY(0) scaleX(1.1) scaleY(.9)}100%{transform:translateY(0) scaleX(1) scaleY(1)}}
+        @keyframes ob-bubble{from{opacity:0;transform:translateY(6px) scale(.96)}to{opacity:1;transform:none}}
+        .ob-bob{animation:ob-bob 3.4s ease-in-out infinite; transform-origin:center bottom}
+        .ob-jump{animation:ob-jump .85s cubic-bezier(.34,1.4,.5,1); transform-origin:center bottom}
+        .ob-bubble{animation:ob-bubble .3s ease-out}
+        @media (prefers-reduced-motion: reduce){.ob-bob,.ob-jump{animation:none}}
+      `}</style>
       <div
         className="absolute inset-0 pointer-events-none"
         style={{
@@ -389,7 +465,7 @@ export default function Onboarding() {
             </motion.div>
           )}
 
-          {/* Step 4: Welcome */}
+          {/* Step 4: Welcome + brief platform walkthrough */}
           {step === "welcome" && (
             <motion.div key="welcome" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="text-center space-y-6">
               <div className="w-16 h-16 rounded-2xl bg-primary/15 flex items-center justify-center mx-auto">
@@ -397,14 +473,34 @@ export default function Onboarding() {
               </div>
               <div>
                 <h1 className="text-3xl font-bold text-white mb-2">Welcome to AIson! 🎉</h1>
-                <p className="text-white/40 text-sm">Your brand profile is ready. Let's start creating amazing content.</p>
+                <p className="text-white/40 text-sm">Your brand is set up. Here's a quick tour of what you can do.</p>
               </div>
+
+              <div className="grid gap-3 text-left">
+                {[
+                  { icon: "💬", title: "Chat with your AI marketing agent", desc: "Ask for advice, ideas, or say \"create a post\" — it knows your brand." },
+                  { icon: "✨", title: "Brands", desc: "Your brand's colours, tone & audience — add more brands and switch anytime." },
+                  { icon: "🎨", title: "Content Studio", desc: "Generate on-brand images, videos and captions." },
+                  { icon: "📣", title: "Campaigns", desc: "Plan multi-post campaigns around a goal." },
+                  { icon: "📊", title: "Analytics & Reports", desc: "A competitor-backed strategy report you can download for clients." },
+                  { icon: "📁", title: "Library", desc: "Everything you generate is saved here, ready to schedule or download." },
+                ].map((f) => (
+                  <div key={f.title} className="flex items-start gap-3 rounded-xl border border-white/10 bg-white/[0.03] p-3">
+                    <span className="text-xl leading-none">{f.icon}</span>
+                    <div>
+                      <p className="text-white text-sm font-medium">{f.title}</p>
+                      <p className="text-white/40 text-xs mt-0.5">{f.desc}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
               <div className="space-y-3">
-                <Button onClick={() => navigate("/dashboard")} className="w-full h-12 rounded-xl text-sm font-semibold" style={{ background: "linear-gradient(135deg, hsl(16,95%,47%) 0%, hsl(24,100%,55%) 100%)" }}>
-                  Go to Dashboard <ArrowRight className="w-4 h-4 ml-2" />
+                <Button onClick={() => navigate("/home")} className="w-full h-12 rounded-xl text-sm font-semibold" style={{ background: "linear-gradient(135deg, hsl(16,95%,47%) 0%, hsl(24,100%,55%) 100%)" }}>
+                  Start with the AI agent <ArrowRight className="w-4 h-4 ml-2" />
                 </Button>
-                <Button variant="outline" onClick={() => navigate("/content-studio")} className="w-full h-12 rounded-xl text-sm border-white/10 text-white/60 hover:text-white bg-transparent">
-                  Start creating content
+                <Button variant="outline" onClick={() => navigate("/brands")} className="w-full h-12 rounded-xl text-sm border-white/10 text-white/60 hover:text-white bg-transparent">
+                  Review my brand first
                 </Button>
               </div>
             </motion.div>

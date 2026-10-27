@@ -1,12 +1,14 @@
 import "https://deno.land/x/xhr@0.1.0/mod.ts";
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.7.1";
+import { claudeChatCompletion, hasClaude } from "../_shared/claude.ts";
+import { noProviderResponse, openaiChatCompletion, resolveImageKey, resolveOpenAIKey } from "../_shared/openai.ts";
 
 const DEFAULT_MODEL = "openai/gpt-5";
 const OPENAI_FALLBACK_MODEL = "gpt-4o-mini";
 const DEFAULT_GATEWAY_IMAGE_MODEL = "google/gemini-2.5-flash-image";
 
-const DIRECT_OPENAI_MODELS = new Set(["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo", "dall-e-3"]);
+const DIRECT_OPENAI_MODELS = new Set<string>(); // routed through shared provider (Groq/Llama)
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -98,8 +100,17 @@ async function callOpenAIImage(prompt: string, openaiKey: string) {
   });
 }
 
-async function callTextAI(prompt: string, model: string, lovableKey: string, openaiKey: string | null) {
+async function callTextAI(prompt: string, model: string, openaiKey: string | null) {
   const normalizedModel = normalizeModel(model);
+
+  // All AI chat/text goes through Claude when configured
+  if (hasClaude()) {
+    const response = await claudeChatCompletion({
+      messages: [{ role: "user", content: prompt }],
+    });
+    if (response.ok) return response;
+    console.warn("Claude failed, falling back:", response.status);
+  }
 
   if (isDirectOpenAIModel(normalizedModel) && openaiKey) {
     let openaiModel = getOpenAIModelName(normalizedModel);
@@ -114,56 +125,26 @@ async function callTextAI(prompt: string, model: string, lovableKey: string, ope
     return response;
   }
 
-  return await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${lovableKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: normalizedModel || DEFAULT_MODEL,
+  if (openaiKey) {
+    return await openaiChatCompletion(openaiKey, {
+      model: normalizedModel,
       messages: [{ role: "user", content: prompt }],
-    }),
-  });
+    });
+  }
+
+  return noProviderResponse();
 }
 
 async function callImageAI(
   prompt: string,
-  model: string,
-  lovableKey: string,
+  _model: string,
   openaiKey: string | null,
 ): Promise<{ response: Response; source: ImageResponseSource }> {
-  const normalizedModel = normalizeModel(model);
-
-  if (isDirectOpenAIModel(normalizedModel) && openaiKey) {
+  if (openaiKey) {
     const openAIResponse = await callOpenAIImage(prompt, openaiKey);
-
-    if (openAIResponse.ok) {
-      return { response: openAIResponse, source: "openai" };
-    }
-
-    if (![400, 404].includes(openAIResponse.status)) {
-      return { response: openAIResponse, source: "openai" };
-    }
-
-    console.warn("OpenAI image model unavailable; falling back to gateway image model.");
+    return { response: openAIResponse, source: "openai" };
   }
-
-  // Always use an image-capable model for image generation
-  const gatewayResponse = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${lovableKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: DEFAULT_GATEWAY_IMAGE_MODEL,
-      messages: [{ role: "user", content: prompt }],
-      modalities: ["image", "text"],
-    }),
-  });
-
-  return { response: gatewayResponse, source: "gateway" };
+  return { response: noProviderResponse(), source: "openai" };
 }
 
 serve(async (req) => {
@@ -182,10 +163,8 @@ serve(async (req) => {
 
     const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
     const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY");
-    const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
-    const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY");
 
-    if (!LOVABLE_API_KEY || !SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
       console.error("Missing required environment variables");
       return new Response(JSON.stringify({ error: "Service temporarily unavailable" }), {
         status: 500,
@@ -208,8 +187,20 @@ serve(async (req) => {
     }
 
     const userId = claimsData.claims.sub;
+    const OPENAI_API_KEY = await resolveOpenAIKey(userId);
+    const IMAGE_API_KEY = await resolveImageKey(userId);
 
-    const { campaignId, presetPrompt, imagePresetPrompt, preferredModel, batchSize, batchIndex } = await req.json();
+    // No AI provider → fail clearly instead of silently generating 0 posts.
+    if (!hasClaude() && !OPENAI_API_KEY) {
+      return new Response(JSON.stringify({
+        error: "AI is not configured yet. Set the LLM_API_KEY backend secret (free Groq key) or add your own key in Account → API Keys, then try again.",
+      }), {
+        status: 503,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    const { campaignId, presetPrompt, imagePresetPrompt, preferredModel, batchSize, batchIndex, strategyPrompt, strategySystemContext } = await req.json();
 
     if (!campaignId || typeof campaignId !== "string") {
       return new Response(JSON.stringify({ error: "A valid campaign ID is required" }), {
@@ -259,6 +250,35 @@ serve(async (req) => {
         : "";
 
     const brandColorContext = colorInstruction || fallbackColorInstruction;
+    const brandMemory = (campaign.brand_intelligence as Record<string, any> | null) || {};
+    const brandPillars = Array.isArray(brandMemory.content_themes) ? brandMemory.content_themes : [];
+    const brandMessages = Array.isArray(brandMemory.key_messages) ? brandMemory.key_messages : [];
+    const ctaPatterns = Array.isArray(brandMemory.cta_patterns) ? brandMemory.cta_patterns : [];
+    const strategySummary = [
+      brandMemory.brand_description ? `Brand position: ${String(brandMemory.brand_description).slice(0, 400)}` : "",
+      brandMemory.target_audience_signals ? `Audience signals: ${String(brandMemory.target_audience_signals).slice(0, 240)}` : "",
+      brandMemory.tone_of_voice ? `Tone baseline: ${String(brandMemory.tone_of_voice).slice(0, 80)}` : "",
+      brandPillars.length ? `Content pillars: ${brandPillars.slice(0, 4).join(", ")}` : "",
+      brandMessages.length ? `Key messages: ${brandMessages.slice(0, 4).join(" | ")}` : "",
+      ctaPatterns.length ? `CTA patterns to preserve: ${ctaPatterns.slice(0, 3).join(" | ")}` : "",
+      campaign.key_offers_or_topics?.length ? `Current campaign topics: ${campaign.key_offers_or_topics.join(", ")}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const orchestrationInstruction = strategySummary
+      ? `\n\nTWO-STAGE ORCHESTRATION MODEL:\n1. First reason strategically from the brand memory and campaign objective.\n2. Then convert that reasoning into a precise execution-ready social asset.\nDo not output the analysis separately, but let it shape the final creative.\n\nBRAND MEMORY ENGINE CONTEXT:\n${strategySummary}`
+      : "";
+    const optimizedPromptContext = typeof strategyPrompt === "string" && strategyPrompt.trim()
+      ? `\n\nOPTIMIZED CAMPAIGN PROMPT:\n${strategyPrompt.trim().slice(0, 4000)}`
+      : typeof brandMemory?.strategy_prompt === "string" && brandMemory.strategy_prompt.trim()
+        ? `\n\nOPTIMIZED CAMPAIGN PROMPT:\n${String(brandMemory.strategy_prompt).trim().slice(0, 4000)}`
+        : "";
+    const optimizedSystemContext = typeof strategySystemContext === "string" && strategySystemContext.trim()
+      ? `\n\nSTRATEGY SYSTEM CONTEXT:\n${strategySystemContext.trim().slice(0, 4000)}`
+      : typeof brandMemory?.strategy_system_context === "string" && brandMemory.strategy_system_context.trim()
+        ? `\n\nSTRATEGY SYSTEM CONTEXT:\n${String(brandMemory.strategy_system_context).trim().slice(0, 4000)}`
+        : "";
 
     // Channel-specific style guides for native adaptation
     const channelStyles: Record<string, { caption: string; visual: string; aspect: string }> = {
@@ -324,8 +344,13 @@ serve(async (req) => {
       const channel = selectedChannels[postIndex % selectedChannels.length].toLowerCase();
       const style = channelStyles[channel] || channelStyles.instagram;
 
-      // Alternate image/text but lean toward image (every 3rd is text-only)
-      const contentType = (postIndex % 3 === 2) ? "text" : "image";
+      // Alternate image/text but lean toward image (every 3rd is text-only).
+      // If no image provider is configured, everything is text so the campaign
+      // still produces content instead of silently skipping image posts.
+      // Higgsfield generates images async (they land in the Library separately),
+      // so campaign posts are text; only a real OpenAI image key does inline images.
+      const canImage = !!IMAGE_API_KEY;
+      const contentType = (!canImage || postIndex % 3 === 2) ? "text" : "image";
 
       const creative: {
         user_id: string;
@@ -350,26 +375,18 @@ serve(async (req) => {
         const imageStylePrompt = imagePresetPrompt || presetPrompt;
         const presetContext = imageStylePrompt ? `\n\nImage style and brand direction:\n${String(imageStylePrompt).slice(0, 4000)}` : "";
 
-        const imagePrompt = `Create a ${style.aspect} ${channel} social media image for ${String(companyDetails?.company_name || "a business").slice(0, 200)}.\nCampaign objective: ${String(campaign.objective || "").slice(0, 500)}.\nTone: ${String(campaign.tone || "professional").slice(0, 100)}.\n${style.visual}${brandColorContext}${presetContext}\n\nIMPORTANT: Visual must use brand colors and feel native to ${channel}.`;
+        const imagePrompt = `Create a ${style.aspect} ${channel} social media image for ${String(companyDetails?.company_name || "a business").slice(0, 200)}.\nCampaign objective: ${String(campaign.objective || "").slice(0, 500)}.\nTone: ${String(campaign.tone || "professional").slice(0, 100)}.\n${style.visual}${brandColorContext}${presetContext}${orchestrationInstruction}${optimizedSystemContext}${optimizedPromptContext}\n\nIMPORTANT: Visual must use brand colors, express the brand memory context, and feel native to ${channel}.`;
 
-        const { response: imageResponse, source } = await callImageAI(
-          imagePrompt,
-          selectedModel,
-          LOVABLE_API_KEY,
-          OPENAI_API_KEY || null,
-        );
-
-        if (!imageResponse.ok) {
-          const errorText = await imageResponse.text();
-          console.error("Image generation failed:", imageResponse.status, getProviderErrorMessage(errorText) || errorText);
-          continue;
+        let imageUrl: string | null = null;
+        if (IMAGE_API_KEY) {
+          const { response: imageResponse, source } = await callImageAI(imagePrompt, selectedModel, IMAGE_API_KEY);
+          if (imageResponse.ok) {
+            const imageData = await imageResponse.json();
+            imageUrl = source === "openai"
+              ? imageData?.data?.[0]?.url
+              : imageData?.choices?.[0]?.message?.images?.[0]?.image_url?.url;
+          }
         }
-
-        const imageData = await imageResponse.json();
-        const imageUrl =
-          source === "openai"
-            ? imageData?.data?.[0]?.url
-            : imageData?.choices?.[0]?.message?.images?.[0]?.image_url?.url;
 
         if (!imageUrl || typeof imageUrl !== "string") continue;
 
@@ -377,9 +394,9 @@ serve(async (req) => {
         creative.alt_text = `${channel} visual: ${String(campaign.objective || "").slice(0, 100)}`;
 
         const captionPresetContext = presetPrompt ? `\n\nFollow these style guidelines:\n${String(presetPrompt).slice(0, 2000)}` : "";
-        const captionPrompt = `Write a ${channel}-native caption for ${String(companyDetails?.company_name || "a business").slice(0, 200)}.\nCampaign objective: ${String(campaign.objective || "").slice(0, 500)}\nTone: ${String(campaign.tone || "professional").slice(0, 100)}\n${channelDirective}${captionPresetContext}`;
+        const captionPrompt = `Write a ${channel}-native caption for ${String(companyDetails?.company_name || "a business").slice(0, 200)}.\nCampaign objective: ${String(campaign.objective || "").slice(0, 500)}\nTone: ${String(campaign.tone || "professional").slice(0, 100)}\n${channelDirective}${captionPresetContext}${orchestrationInstruction}${optimizedSystemContext}${optimizedPromptContext}`;
 
-        const captionResponse = await callTextAI(captionPrompt, selectedModel, LOVABLE_API_KEY, OPENAI_API_KEY || null);
+        const captionResponse = await callTextAI(captionPrompt, selectedModel, OPENAI_API_KEY);
         if (captionResponse.ok) {
           const captionData = await captionResponse.json();
           creative.caption = extractAssistantText(captionData);
@@ -391,9 +408,9 @@ serve(async (req) => {
       } else {
         const textPresetContext = presetPrompt ? `\n\nFollow these style guidelines:\n${String(presetPrompt).slice(0, 2000)}` : "";
 
-        const textPrompt = `Create a ${channel}-native social post for ${String(companyDetails?.company_name || "a business").slice(0, 200)}.\nCampaign objective: ${String(campaign.objective || "").slice(0, 500)}\nTone: ${String(campaign.tone || "professional").slice(0, 100)}\nTarget audience: ${String(companyDetails?.target_audience || "general audience").slice(0, 500)}\nBusiness type: ${String(companyDetails?.business_type || "").slice(0, 100)}\n${channelDirective}${textPresetContext}`;
+        const textPrompt = `Create a ${channel}-native social post for ${String(companyDetails?.company_name || "a business").slice(0, 200)}.\nCampaign objective: ${String(campaign.objective || "").slice(0, 500)}\nTone: ${String(campaign.tone || "professional").slice(0, 100)}\nTarget audience: ${String(companyDetails?.target_audience || "general audience").slice(0, 500)}\nBusiness type: ${String(companyDetails?.business_type || "").slice(0, 100)}\n${channelDirective}${textPresetContext}${orchestrationInstruction}${optimizedSystemContext}${optimizedPromptContext}`;
 
-        const textResponse = await callTextAI(textPrompt, selectedModel, LOVABLE_API_KEY, OPENAI_API_KEY || null);
+        const textResponse = await callTextAI(textPrompt, selectedModel, OPENAI_API_KEY);
         if (!textResponse.ok) {
           const errorText = await textResponse.text();
           console.error("Text generation failed:", textResponse.status, getProviderErrorMessage(errorText) || errorText);

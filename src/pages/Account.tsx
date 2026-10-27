@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
 import {
   User, Building2, Key, DollarSign, LogOut, Save, Plus, Trash2,
-  Images, Share2, Loader2
+  Images, Share2, Loader2, Sparkles, Star
 } from "lucide-react";
+import { RewardsPanel } from "@/components/RewardsPanel";
 import { toast } from "sonner";
 import type { Session } from "@supabase/supabase-js";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -15,11 +16,16 @@ import { useBrandIntelligence } from "@/hooks/useBrandIntelligence";
 import { BrandIntelligenceSummary } from "@/components/BrandIntelligenceSummary";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { motion } from "framer-motion";
+import { assistantVoiceOptions, DEFAULT_ASSISTANT_VOICE, DEFAULT_ASSISTANT_VOICE_SPEED } from "@/lib/assistantVoiceOptions";
+import { saveBrowserVargApiKey } from "@/lib/vargVideoClient";
+import { shouldBypassAuth } from "@/lib/localAccessBypass";
 
 const DEFAULT_MODEL = "openai/gpt-5";
 
 const Account = () => {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const initialTab = searchParams.get("tab") || "profile";
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -34,6 +40,9 @@ const Account = () => {
   const [location, setLocation] = useState("");
   const [brandColors, setBrandColors] = useState<string[]>(["#000000"]);
   const [preferredModel, setPreferredModel] = useState(DEFAULT_MODEL);
+  const [assistantVoice, setAssistantVoice] = useState(DEFAULT_ASSISTANT_VOICE);
+  const [assistantVoiceSpeed, setAssistantVoiceSpeed] = useState(String(DEFAULT_ASSISTANT_VOICE_SPEED));
+  const [assistantVoiceEnabled, setAssistantVoiceEnabled] = useState(true);
 
   const [balance, setBalance] = useState(0);
   const [showTopUpModal, setShowTopUpModal] = useState(false);
@@ -55,13 +64,28 @@ const Account = () => {
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
-      if (!session) { navigate("/auth"); return; }
+      if (!session) {
+        if (shouldBypassAuth()) {
+          setSession(null);
+          setLoading(false);
+          return;
+        }
+        navigate("/auth");
+        return;
+      }
       setSession(session);
       loadUserData(session.user.id);
       loadExistingProfile();
     });
     const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
-      if (!session) navigate("/auth");
+      if (!session) {
+        if (shouldBypassAuth()) {
+          setSession(null);
+          setLoading(false);
+          return;
+        }
+        navigate("/auth");
+      }
       else setSession(session);
     });
     return () => subscription.unsubscribe();
@@ -81,16 +105,25 @@ const Account = () => {
         setBusinessType(company.business_type || "");
         setLocation(company.location || "");
         setPreferredModel((company as any).preferred_model || DEFAULT_MODEL);
+        setAssistantVoice((company as any).assistant_voice || DEFAULT_ASSISTANT_VOICE);
+        setAssistantVoiceSpeed(String((company as any).assistant_voice_speed ?? DEFAULT_ASSISTANT_VOICE_SPEED));
+        setAssistantVoiceEnabled((company as any).assistant_voice_enabled ?? true);
         const colors = company.brand_colors;
         if (Array.isArray(colors) && colors.every(c => typeof c === "string")) setBrandColors(colors as string[]);
         else setBrandColors(["#000000"]);
+        // Reward: having company/brand details unlocks the "Brand Builder" star.
+        if (company.company_name) window.dispatchEvent(new Event("aison:brand-ready"));
       }
 
       const { data: userBalance } = await supabase.from("user_balance").select("*").eq("user_id", userId).single();
       if (userBalance) setBalance(Number(userBalance.balance));
 
       const { data: connections } = await supabase.from("social_connections_safe" as any).select("*").eq("user_id", userId);
-      if (connections) setSocialConnections(connections);
+      if (connections) {
+        setSocialConnections(connections);
+        // Reward: a linked social account unlocks the "Plugged In" star.
+        if (connections.length > 0) window.dispatchEvent(new Event("aison:social-connected"));
+      }
 
       const { data: keysResult } = await supabase.functions.invoke("manage-api-keys", { body: { action: "list" } });
       if (keysResult?.keys) setApiKeys(keysResult.keys);
@@ -106,11 +139,15 @@ const Account = () => {
     } catch { toast.error("Something went wrong saving your data. Please try again."); }
   };
 
+  // Accept URLs with or without a protocol (e.g. "example.com" or an Instagram handle URL).
+  const lenientUrl = z.string().trim().max(255)
+    .refine((v) => v === "" || /^([a-z]+:\/\/)?[^\s.]+\.[^\s]{2,}/i.test(v), { message: "Enter a valid website (e.g. example.com)" })
+    .optional();
   const companySchema = z.object({
     companyName: z.string().trim().max(100).optional(),
-    website: z.string().trim().url().max(255).or(z.literal("")).optional(),
+    website: lenientUrl,
     targetAudience: z.string().trim().max(500).optional(),
-    brandSourceUrl: z.string().trim().url().max(255).or(z.literal("")).optional(),
+    brandSourceUrl: lenientUrl,
     businessType: z.string().trim().max(100).optional(),
     location: z.string().trim().max(100).optional(),
     brandColors: z.array(z.string().regex(/^#[0-9A-Fa-f]{6}$/)).min(1).max(5),
@@ -126,9 +163,13 @@ const Account = () => {
         target_audience: targetAudience.trim(), brand_source_url: brandSourceUrl.trim(),
         business_type: businessType.trim(), location: location.trim(), brand_colors: brandColors,
         preferred_model: preferredModel || DEFAULT_MODEL,
+        assistant_voice: assistantVoice || DEFAULT_ASSISTANT_VOICE,
+        assistant_voice_speed: Number(assistantVoiceSpeed || DEFAULT_ASSISTANT_VOICE_SPEED),
+        assistant_voice_enabled: assistantVoiceEnabled,
       } as any, { onConflict: "user_id" });
       if (error) throw error;
       toast.success("Changes saved");
+      if (companyName.trim()) window.dispatchEvent(new Event("aison:brand-ready"));
       const urlToScan = brandSourceUrl.trim() || website.trim();
       if (urlToScan) { setBrandScanDone(false); const profile = await scanUrl(urlToScan); if (profile) setBrandScanDone(true); }
     } catch { toast.error("Something went wrong saving your data. Please try again."); }
@@ -152,6 +193,9 @@ const Account = () => {
         location: profile.location || location.trim(),
         brand_colors: [...profile.primary_colors, ...(profile.secondary_colors || [])].filter(Boolean).slice(0, 5),
         preferred_model: preferredModel || DEFAULT_MODEL,
+        assistant_voice: assistantVoice || DEFAULT_ASSISTANT_VOICE,
+        assistant_voice_speed: Number(assistantVoiceSpeed || DEFAULT_ASSISTANT_VOICE_SPEED),
+        assistant_voice_enabled: assistantVoiceEnabled,
       } as any, { onConflict: "user_id" });
       toast.success("Changes saved — brand intelligence applied");
     } catch { toast.error("Failed to save. Please try again."); }
@@ -171,6 +215,7 @@ const Account = () => {
     try {
       const { data, error } = await supabase.functions.invoke("manage-api-keys", { body: { action: "create", service_name: newApiService, api_key: newApiKey } });
       if (error) throw error;
+      if (newApiService === "varg") saveBrowserVargApiKey(newApiKey);
       setApiKeys([...apiKeys, data.key]); setNewApiService(""); setNewApiKey(""); setShowApiKeyModal(false);
       toast.success("API key added successfully!");
     } catch { toast.error("Something went wrong saving your data. Please try again."); }
@@ -286,13 +331,16 @@ const Account = () => {
       </header>
 
       <main className="max-w-5xl mx-auto px-4 py-6 sm:px-6 lg:px-8">
-        <Tabs defaultValue="profile" className="w-full">
+        <Tabs defaultValue={initialTab} className="w-full">
           <TabsList className="w-full justify-start bg-card border border-border rounded-xl p-1 mb-6 overflow-x-auto flex-nowrap">
             <TabsTrigger value="profile" className="rounded-lg data-[state=active]:bg-primary data-[state=active]:text-primary-foreground gap-2 text-sm">
               <User className="w-4 h-4" /> Profile
             </TabsTrigger>
+            <TabsTrigger value="rewards" className="rounded-lg data-[state=active]:bg-primary data-[state=active]:text-primary-foreground gap-2 text-sm">
+              <Star className="w-4 h-4" /> Stars
+            </TabsTrigger>
             <TabsTrigger value="brand" className="rounded-lg data-[state=active]:bg-primary data-[state=active]:text-primary-foreground gap-2 text-sm">
-              <Building2 className="w-4 h-4" /> Brand
+              <Building2 className="w-4 h-4" /> Company
             </TabsTrigger>
             <TabsTrigger value="connections" className="rounded-lg data-[state=active]:bg-primary data-[state=active]:text-primary-foreground gap-2 text-sm">
               <Share2 className="w-4 h-4" /> Connections
@@ -327,10 +375,34 @@ const Account = () => {
             </motion.div>
           </TabsContent>
 
+          {/* ─── REWARDS / STARS TAB ─── */}
+          <TabsContent value="rewards">
+            <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className="space-y-4 max-w-3xl">
+              <div>
+                <h2 className="text-lg font-semibold text-foreground">Collect Your Stars ⭐</h2>
+                <p className="text-sm text-muted-foreground mt-0.5">
+                  Earn stars as you use AIson. Hit 50 for a discount, 100 for a free month.
+                </p>
+              </div>
+              <RewardsPanel userId={session?.user.id ?? null} />
+            </motion.div>
+          </TabsContent>
+
           {/* ─── BRAND TAB ─── */}
           <TabsContent value="brand">
             <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className="space-y-6 max-w-2xl">
               <div className="bg-card rounded-2xl p-6 border border-border">
+                <div className="rounded-xl border border-primary/30 bg-primary/5 p-3 mb-5 flex items-start gap-3">
+                  <Sparkles className="w-5 h-5 text-primary shrink-0 mt-0.5" />
+                  <div className="text-sm">
+                    <p className="font-medium text-foreground">Company details are now managed per brand</p>
+                    <p className="text-muted-foreground mt-0.5">
+                      Each brand has its own name, industry, website, location, audience, tone and colours —
+                      edit them on the <button type="button" onClick={() => navigate("/brands")} className="text-primary underline underline-offset-2">Brands page</button>.
+                      The fields below reflect your <b>active</b> brand.
+                    </p>
+                  </div>
+                </div>
                 <h2 className="text-lg font-semibold text-foreground mb-5">Company Details</h2>
                 <div className="space-y-4">
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -373,58 +445,57 @@ const Account = () => {
                       </Alert>
                     )}
                   </div>
-                  <div>
-                    <label className={labelCls}>Preferred AI Model</label>
-                    <select value={preferredModel} onChange={(e) => setPreferredModel(e.target.value)} className={inputCls}>
-                      <option value="openai/gpt-4o-mini">Default (ChatGPT 4o Mini)</option>
-                      <optgroup label="OpenAI">
-                        <option value="openai/gpt-4o-mini">ChatGPT 4o Mini — Fast</option>
-                        <option value="openai/gpt-4o">ChatGPT 4o — Higher quality</option>
-                        <option value="openai/gpt-5-mini">GPT-5 Mini — Strong reasoning</option>
-                        <option value="openai/gpt-5">GPT-5 — Most capable</option>
-                        <option value="openai/gpt-5-nano">GPT-5 Nano — Fastest</option>
-                        <option value="openai/gpt-5.2">GPT-5.2 — Enhanced reasoning</option>
-                      </optgroup>
-                      <optgroup label="Google Gemini">
-                        <option value="google/gemini-3-flash-preview">Gemini 3 Flash Preview</option>
-                        <option value="google/gemini-2.5-flash">Gemini 2.5 Flash</option>
-                        <option value="google/gemini-2.5-pro">Gemini 2.5 Pro</option>
-                        <option value="google/gemini-3.1-pro-preview">Gemini 3.1 Pro Preview</option>
-                      </optgroup>
-                    </select>
-                  </div>
-
-                  {/* Brand Colors */}
-                  <div>
-                    <div className="flex items-center justify-between mb-1.5">
-                      <label className="text-sm font-medium text-foreground">Brand Colors</label>
-                      <button onClick={handleAddColor} disabled={brandColors.length >= 5} className="text-xs flex items-center gap-1 px-2 py-1 text-primary hover:bg-primary/10 rounded transition-colors disabled:opacity-50">
-                        <Plus className="w-3 h-3" /> Add
-                      </button>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                    <div>
+                      <label className={labelCls}>Assistant Voice</label>
+                      <select value={assistantVoice} onChange={(e) => setAssistantVoice(e.target.value)} className={inputCls}>
+                        {assistantVoiceOptions.map((voice) => (
+                          <option key={voice} value={voice}>
+                            {voice}
+                          </option>
+                        ))}
+                      </select>
                     </div>
-                    <div className="flex gap-2 flex-wrap">
-                      {brandColors.map((color, i) => (
-                        <div key={i} className="flex items-center gap-1.5 bg-secondary rounded-xl px-2 py-1.5">
-                          <input type="color" value={color} onChange={(e) => handleColorChange(i, e.target.value)} className="w-8 h-8 rounded-lg border border-border cursor-pointer" />
-                          <span className="text-xs font-mono text-muted-foreground">{color}</span>
-                          {brandColors.length > 1 && (
-                            <button onClick={() => handleRemoveColor(i)} className="p-1 text-destructive/60 hover:text-destructive transition-colors">
-                              <Trash2 className="w-3 h-3" />
-                            </button>
-                          )}
-                        </div>
-                      ))}
+                    <div>
+                      <label className={labelCls}>Voice Speed</label>
+                      <input
+                        type="number"
+                        min="0.75"
+                        max="1.25"
+                        step="0.05"
+                        value={assistantVoiceSpeed}
+                        onChange={(e) => setAssistantVoiceSpeed(e.target.value)}
+                        className={inputCls}
+                      />
+                    </div>
+                    <div>
+                      <label className={labelCls}>Voice Output</label>
+                      <select
+                        value={assistantVoiceEnabled ? "enabled" : "disabled"}
+                        onChange={(e) => setAssistantVoiceEnabled(e.target.value === "enabled")}
+                        className={inputCls}
+                      >
+                        <option value="enabled">Enabled</option>
+                        <option value="disabled">Muted</option>
+                      </select>
                     </div>
                   </div>
+                  <p className="text-xs text-muted-foreground">
+                    AI-generated voice. This controls the OpenAI voice used for assistant speech playback.
+                  </p>
 
-                  {brandProfile && (
-                    <BrandIntelligenceSummary
-                      profile={brandProfile}
-                      onRefresh={() => { const url = brandSourceUrl.trim() || website.trim(); if (url) scanUrl(url, { force_refresh: true }); }}
-                      isRefreshing={isScanning}
-                      onApplyToAccount={handleApplyBrandToAccount}
-                    />
-                  )}
+                  {/* Brand identity (logo colours, tone, visual style, and multiple brands)
+                      now lives on the dedicated Brands page. */}
+                  <div className="rounded-xl border border-border bg-secondary/40 p-4 flex items-start gap-3">
+                    <Sparkles className="w-5 h-5 text-primary shrink-0 mt-0.5" />
+                    <div className="text-sm">
+                      <p className="font-medium text-foreground">Brand identity moved to the Brands page</p>
+                      <p className="text-muted-foreground mt-0.5">
+                        Manage your brand colours, tone, visual style — and add or switch between multiple brands —{" "}
+                        <button type="button" onClick={() => navigate("/brands")} className="text-primary underline underline-offset-2">on the Brands page</button>.
+                      </p>
+                    </div>
+                  </div>
 
                   <button onClick={handleUpdateCompany} disabled={isScanning} className="flex items-center gap-2 px-5 py-2.5 bg-primary hover:bg-primary/90 text-primary-foreground rounded-xl text-sm font-medium transition-all disabled:opacity-50">
                     {isScanning ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
@@ -590,13 +661,19 @@ const Account = () => {
               <select value={newApiService} onChange={(e) => setNewApiService(e.target.value)} className={inputCls}>
                 <option value="">Select service…</option>
                 <option value="openai">OpenAI</option>
+                <option value="varg">Varg Video Engine</option>
                 <option value="anthropic">Anthropic</option>
                 <option value="google">Google AI</option>
               </select>
             </div>
             <div>
               <label className={labelCls}>API Key</label>
-              <input type="password" value={newApiKey} onChange={(e) => setNewApiKey(e.target.value)} placeholder="sk-..." className={inputCls} />
+              <input type="password" value={newApiKey} onChange={(e) => setNewApiKey(e.target.value)} placeholder={newApiService === "varg" ? "varg_live_..." : "sk-..."} className={inputCls} />
+              {newApiService === "varg" && (
+                <p className="mt-2 text-xs text-muted-foreground">
+                  Varg is used as AIson&apos;s primary video engine. Get a key from docs.varg.ai / app.varg.ai and save it here.
+                </p>
+              )}
             </div>
             <button onClick={handleAddApiKey} className="w-full py-3 bg-primary text-primary-foreground font-semibold rounded-xl transition-all">Add API Key</button>
           </div>

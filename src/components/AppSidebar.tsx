@@ -1,6 +1,7 @@
 import { useNavigate, useLocation } from "react-router-dom";
 import {
   LayoutDashboard,
+  Wand2,
   Megaphone,
   CalendarClock,
   Send,
@@ -8,8 +9,13 @@ import {
   FolderOpen,
   User,
   LogOut,
+  ShieldCheck,
 } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
+import { isAdminEmail, checkIsAdmin } from "@/lib/admin";
+import { useBrands } from "@/hooks/useBrands";
+import { loadSummary } from "@/lib/rewards";
+import { Check, ChevronsUpDown, Star } from "lucide-react";
 import {
   Sidebar,
   SidebarContent,
@@ -38,6 +44,8 @@ import { Sparkles } from "lucide-react";
 
 const mainNav = [
   { title: "Main Page", url: "/home", icon: LayoutDashboard },
+  { title: "Brands", url: "/brands", icon: Sparkles },
+  { title: "Content Studio", url: "/content-studio", icon: Wand2 },
   { title: "Campaigns", url: "/campaigns", icon: Megaphone },
   { title: "Scheduler", url: "/scheduled", icon: CalendarClock },
   { title: "Posting", url: "/posting", icon: Send },
@@ -52,14 +60,27 @@ export function AppSidebar() {
   const collapsed = state === "collapsed";
   const [userName, setUserName] = useState("");
   const [userEmail, setUserEmail] = useState("");
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [stars, setStars] = useState<number | null>(null);
 
   useEffect(() => {
+    let alive = true;
     supabase.auth.getSession().then(({ data: { session } }) => {
-      if (session?.user) {
-        setUserEmail(session.user.email || "");
-        setUserName(session.user.user_metadata?.full_name || session.user.email?.split("@")[0] || "");
-      }
+      if (!session?.user || !alive) return;
+      setUserEmail(session.user.email || "");
+      setUserName(session.user.user_metadata?.full_name || session.user.email?.split("@")[0] || "");
+      setIsAdmin(isAdminEmail(session.user.email));
+      checkIsAdmin(session.user.id, session.user.email).then((v) => { if (alive) setIsAdmin(v); });
+      const refreshStars = () => loadSummary(session.user.id).then((s) => { if (alive) setStars(s.total); });
+      refreshStars();
+      window.addEventListener("aison:stars-updated", refreshStars);
+      window.addEventListener("aison:star-earned", refreshStars);
+      (window as any).__aisonStarsCleanup = () => {
+        window.removeEventListener("aison:stars-updated", refreshStars);
+        window.removeEventListener("aison:star-earned", refreshStars);
+      };
     });
+    return () => { alive = false; (window as any).__aisonStarsCleanup?.(); };
   }, []);
 
   const isActive = (path: string) => location.pathname === path;
@@ -86,6 +107,7 @@ export function AppSidebar() {
       <SidebarSeparator />
 
       <SidebarContent>
+        {!collapsed && <BrandSwitcher />}
         <SidebarGroup>
           <SidebarGroupLabel>Navigation</SidebarGroupLabel>
           <SidebarGroupContent>
@@ -103,12 +125,38 @@ export function AppSidebar() {
                   </SidebarMenuButton>
                 </SidebarMenuItem>
               ))}
+              {isAdmin && (
+                <SidebarMenuItem key="Admin">
+                  <SidebarMenuButton
+                    onClick={() => navigate("/admin")}
+                    isActive={isActive("/admin")}
+                    tooltip="Admin"
+                    className={isActive("/admin") ? "bg-primary/10 text-primary font-medium" : "text-muted-foreground hover:text-foreground"}
+                  >
+                    <ShieldCheck className="w-4 h-4" />
+                    <span>Admin</span>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              )}
             </SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>
       </SidebarContent>
 
       <SidebarFooter className="p-3">
+        <button
+          onClick={() => navigate("/account?tab=rewards")}
+          title="Collect Your Stars"
+          className={`flex items-center ${collapsed ? "justify-center" : "gap-2"} w-full p-2 mb-1 rounded-lg border border-amber-300/25 bg-amber-300/5 hover:bg-amber-300/10 transition-colors text-left`}
+        >
+          <Star className="w-4 h-4 shrink-0 fill-amber-300 text-amber-300" />
+          {!collapsed && (
+            <>
+              <span className="text-sm font-medium text-foreground flex-1">Your Stars</span>
+              <span className="text-sm font-bold tabular-nums text-amber-300">{stars ?? "—"}</span>
+            </>
+          )}
+        </button>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <button className="flex items-center gap-3 w-full p-2 rounded-lg hover:bg-accent transition-colors text-left">
@@ -137,5 +185,43 @@ export function AppSidebar() {
         </DropdownMenu>
       </SidebarFooter>
     </Sidebar>
+  );
+}
+
+function BrandSwitcher() {
+  const navigate = useNavigate();
+  const { brands, activeBrand, activeBrandId, loading, setActive } = useBrands();
+
+  if (loading || brands.length === 0) return null;
+
+  return (
+    <div className="px-3 pt-3">
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <button className="flex items-center gap-2 w-full p-2 rounded-lg border border-border hover:bg-accent transition-colors text-left">
+            <div className="w-6 h-6 rounded bg-primary/15 text-primary flex items-center justify-center shrink-0">
+              <Sparkles className="w-3.5 h-3.5" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className="text-[10px] text-muted-foreground leading-none mb-0.5">Active brand</p>
+              <p className="text-sm font-medium text-foreground truncate leading-none">{activeBrand?.brand_name || "Select"}</p>
+            </div>
+            <ChevronsUpDown className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+          </button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start" className="w-56">
+          {brands.map((b) => (
+            <DropdownMenuItem key={b.id} onClick={() => setActive(b.id)} className="gap-2">
+              <Check className={`w-4 h-4 ${b.id === activeBrandId ? "opacity-100 text-primary" : "opacity-0"}`} />
+              <span className="truncate">{b.brand_name || "Untitled brand"}</span>
+            </DropdownMenuItem>
+          ))}
+          <DropdownMenuSeparator />
+          <DropdownMenuItem onClick={() => navigate("/brands")} className="gap-2 text-muted-foreground">
+            <Sparkles className="w-4 h-4" /> Manage brands
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </div>
   );
 }

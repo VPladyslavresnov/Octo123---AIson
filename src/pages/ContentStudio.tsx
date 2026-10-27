@@ -22,6 +22,11 @@ import { parseContentBlocks } from "@/components/home/parseContentBlocks";
 import { cn } from "@/lib/utils";
 import { createVideoFromImage } from "@/lib/createVideoFromImage";
 import { ParticleField } from "@/components/home/ParticleField";
+import { StrategyProgressFeed } from "@/components/StrategyProgressFeed";
+import { runStrategyPreparation, type StrategyProgressItem, type StrategyResult } from "@/lib/strategyFlow";
+import { buildContentGenerationPrompt } from "@/lib/contentPromptOrchestrator";
+import { generateVargVideoInBrowser, getBrowserVargApiKey } from "@/lib/vargVideoClient";
+import { getBypassRedirectTarget, shouldBypassAuth } from "@/lib/localAccessBypass";
 
 const DEFAULT_MODEL = "openai/gpt-5";
 
@@ -73,6 +78,9 @@ const ContentStudio = () => {
   const [fixTarget, setFixTarget] = useState<string | null>(null);
   const [fixPrompt, setFixPrompt] = useState("");
   const [isFixing, setIsFixing] = useState(false);
+  const [strategyResult, setStrategyResult] = useState<StrategyResult | null>(null);
+  const [isPreparingStrategy, setIsPreparingStrategy] = useState(false);
+  const [strategySteps, setStrategySteps] = useState<StrategyProgressItem[]>([]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const { brandProfile, loadExistingProfile } = useBrandIntelligence();
@@ -91,8 +99,9 @@ const ContentStudio = () => {
   const ensureAuthenticated = async () => {
     const { data: { session } } = await supabase.auth.getSession();
     if (session) return true;
+    if (shouldBypassAuth()) return true;
     toast.error("Please sign in to generate content.");
-    navigate("/auth?redirect=/content-studio");
+    navigate(`${getBypassRedirectTarget()}?redirect=/content-studio`);
     return false;
   };
 
@@ -115,20 +124,50 @@ const ContentStudio = () => {
     if (!isAuthenticated) return;
 
     setIsLoading(true);
+    setIsPreparingStrategy(true);
+    setStrategySteps([]);
     setBlocks([]);
     try {
-      let systemPrompt = selectedPreset ? (contentType === "image" ? imagePresetPrompts[selectedPreset] : presetPrompts[selectedPreset]) : "";
-      if (brandProfile) {
-        const brandSystemPrompt = buildBrandSystemPrompt(brandProfile);
-        systemPrompt = brandSystemPrompt + (systemPrompt ? `\n\nADDITIONAL STYLE: ${systemPrompt}` : '');
+      let strategyPayload: StrategyResult | null = null;
+      try {
+        strategyPayload = await runStrategyPreparation({
+          sourcePrompt: prompt,
+          requestedContentType: contentType,
+          requestedGoal: prompt,
+          preferredModel: (companyDetails as any)?.preferred_model || DEFAULT_MODEL,
+          competitorInputs: brandProfile?.competitors_mentioned || [],
+          onProgress: setStrategySteps,
+        });
+        setStrategyResult(strategyPayload);
+      } catch (strategyError) {
+        console.warn("Strategy engine fallback:", strategyError);
+        setStrategyResult(null);
+      } finally {
+        setIsPreparingStrategy(false);
       }
 
-      let effectivePrompt = prompt;
+      const selectedStylePrompt = selectedPreset
+        ? (contentType === "image" ? imagePresetPrompts[selectedPreset] : presetPrompts[selectedPreset])
+        : "";
+      const promptBundle = await buildContentGenerationPrompt({
+        sourcePrompt: prompt,
+        requestedContentType: contentType,
+        companyDetails,
+        brandProfile,
+        strategyResult: strategyPayload,
+        styleSystemPrompt: [
+          strategyPayload?.optimizedSystemContext,
+          selectedStylePrompt,
+        ].filter(Boolean).join("\n\n"),
+      });
+
+      let systemPrompt = promptBundle.systemPrompt;
+      let effectivePrompt = contentType === "image" ? promptBundle.visualPrompt : promptBundle.userPrompt;
       if (contentType === "image" && selectedPreset) {
         const presetText = imagePresetPrompts[selectedPreset];
         if (prompt.trim() === presetText.trim()) {
           const presetLabels = { promote: "promotional", daily: "daily brand", engage: "engaging" };
-          effectivePrompt = `Create a ${presetLabels[selectedPreset]} social media image for ${(companyDetails as any)?.company_name || "the brand"}`;
+          effectivePrompt = `${promptBundle.visualPrompt}\n\nPreset intent: Create a ${presetLabels[selectedPreset]} social media image for ${(companyDetails as any)?.company_name || "the brand"}`;
         }
       }
 
@@ -153,7 +192,7 @@ const ContentStudio = () => {
       const imagePromise = shouldGenerateImage
         ? supabase.functions.invoke("generate-image", {
             body: {
-              prompt: `Create a social media visual for: ${effectivePrompt}${brandProfile?.primary_colors?.length ? `. Use these brand colours prominently: ${[...(brandProfile.primary_colors || []), ...(brandProfile.secondary_colors || [])].filter(Boolean).slice(0, 3).join(', ')}` : ''}`,
+              prompt: promptBundle.visualPrompt,
               companyDetails, preferredModel: "google/gemini-2.5-flash-image",
               brandProfile: brandProfile ? { brand_name: brandProfile.brand_name, visual_style: brandProfile.visual_style, primary_colors: brandProfile.primary_colors, secondary_colors: brandProfile.secondary_colors } : null,
             }
@@ -165,6 +204,18 @@ const ContentStudio = () => {
 
       const [textResult, imageResult] = await Promise.all([textPromise, imagePromise]);
       if (textResult.error) throw textResult.error;
+
+      // Higgsfield images/videos generate asynchronously and land in the Library
+      // when finished; the function returns { pending: true } immediately.
+      if (textResult.data?.pending) {
+        toast.success(textResult.data.message || `Generating your ${contentType} — it'll appear in your Library shortly.`); window.dispatchEvent(new Event("aison:content-created"));
+        setStrategySteps((prev) => [
+          ...prev.slice(-4),
+          { id: `hf-${Date.now()}`, label: "Higgsfield", detail: "Generating — will appear in your Library.", state: "running" },
+        ]);
+        return;
+      }
+
       const nextContent = textResult.data?.content ?? textResult.data?.url ?? textResult.data?.imageUrl;
       const responseType = textResult.data?.type; // "video_url" or "script" or undefined
       if (!nextContent || typeof nextContent !== "string") throw new Error("No content was returned.");
@@ -196,11 +247,12 @@ const ContentStudio = () => {
         }
         setBlocks(parsed);
       }
-      toast.success("Content generated!");
+      toast.success("Content generated!"); window.dispatchEvent(new Event("aison:content-created"));
     } catch (error: any) {
       const message = await getInvokeErrorMessage(error, "Content generation failed. Please try again.");
       toast.error(message);
     } finally {
+      setIsPreparingStrategy(false);
       setIsLoading(false);
     }
   };
@@ -446,6 +498,66 @@ const ContentStudio = () => {
 
           {/* Generated content feed */}
           <div className="max-w-3xl mx-auto">
+            {isPreparingStrategy && (
+              <div className="mb-6">
+                <StrategyProgressFeed title="Preparing generation strategy" steps={strategySteps} compact />
+              </div>
+            )}
+
+            {strategyResult && !isPreparingStrategy && (
+              <div className="mb-6 rounded-2xl border border-primary/20 bg-card/50 backdrop-blur-md p-4 space-y-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-semibold text-foreground/80">Strategy Engine Active</p>
+                    <p className="text-xs text-muted-foreground">
+                      Research report built from brand context, client account data, and competitor analysis
+                    </p>
+                  </div>
+                  {strategyResult.score != null && (
+                    <div className="rounded-full bg-primary/10 px-3 py-1 text-xs font-semibold text-primary">
+                      Prompt score {strategyResult.score}%
+                    </div>
+                  )}
+                </div>
+
+                {strategyResult.report?.executive_summary && (
+                  <p className="text-sm text-muted-foreground">{strategyResult.report.executive_summary}</p>
+                )}
+
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="rounded-xl border border-border bg-background/40 p-3">
+                    <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground mb-2">Competitors</p>
+                    <div className="flex flex-wrap gap-2">
+                      {strategyResult.resolvedCompetitors.length > 0 ? strategyResult.resolvedCompetitors.slice(0, 4).map((item) => (
+                        <span key={item.name} className="rounded-full border border-border px-2.5 py-1 text-xs text-foreground/70">
+                          {item.name}
+                        </span>
+                      )) : (
+                        <span className="text-xs text-muted-foreground">No confident competitors resolved.</span>
+                      )}
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-border bg-background/40 p-3">
+                    <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground mb-2">Recommended angle</p>
+                    <p className="text-sm text-foreground/70">
+                      {strategyResult.report?.strategy?.recommended_angle || "Strategy report produced without a single dominant angle."}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="rounded-xl border border-border bg-background/40 p-3">
+                  <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground mb-2">Optimized prompt</p>
+                  <p className="text-sm text-foreground/80 whitespace-pre-wrap line-clamp-6">{strategyResult.optimizedPrompt}</p>
+                </div>
+              </div>
+            )}
+
+            {!isPreparingStrategy && strategySteps.length > 0 && !strategyResult && (
+              <div className="mb-6">
+                <StrategyProgressFeed title="Strategy fallback" steps={strategySteps} compact />
+              </div>
+            )}
+
             <GenerationFeed
               blocks={blocks}
               isGenerating={isLoading}
@@ -744,6 +856,9 @@ const ContentStudio = () => {
               <h2 className="text-xl font-semibold mb-4 text-foreground">Your Prompt</h2>
               <Textarea placeholder={`Describe the ${contentType} you want to create...`}
                 value={prompt} onChange={(e) => setPrompt(e.target.value)} className="min-h-[150px] text-base" />
+              <p className="mt-3 text-xs text-muted-foreground">
+                AIson now first builds a research report from your brand, client accounts, and competitors, then generates an optimized prompt before content creation.
+              </p>
               <Button onClick={handleGenerate} disabled={isLoading || !prompt.trim()}
                 className="w-full mt-4 bg-gradient-primary text-primary-foreground hover:scale-105 transition-all" size="lg">
                 {isLoading ? (
@@ -756,6 +871,55 @@ const ContentStudio = () => {
           </div>
 
           <div>
+            {isPreparingStrategy && (
+              <div className="mb-6">
+                <StrategyProgressFeed title="Backend reasoning" steps={strategySteps} />
+              </div>
+            )}
+
+            {strategyResult && (
+              <div className="mb-6 rounded-2xl bg-background p-5 shadow-medium border border-primary/10 space-y-4">
+                <div className="flex items-center justify-between gap-3">
+                  <h2 className="text-lg font-semibold text-foreground">Strategy Report</h2>
+                  {strategyResult.score != null && (
+                    <span className="rounded-full bg-primary/10 px-3 py-1 text-xs font-semibold text-primary">
+                      {strategyResult.score}% quality score
+                    </span>
+                  )}
+                </div>
+                {strategyResult.report?.executive_summary && (
+                  <p className="text-sm text-muted-foreground">{strategyResult.report.executive_summary}</p>
+                )}
+                {strategyResult.report?.competitor_analysis?.landscape_summary && (
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground mb-2">Competitor landscape</p>
+                    <p className="text-sm text-foreground/70">{strategyResult.report.competitor_analysis.landscape_summary}</p>
+                  </div>
+                )}
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground mb-2">Patterns to emulate</p>
+                    <ul className="space-y-2 text-sm text-foreground/70">
+                      {(strategyResult.report?.competitor_analysis?.patterns_to_emulate || []).slice(0, 4).map((item) => (
+                        <li key={item}>• {item}</li>
+                      ))}
+                    </ul>
+                  </div>
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground mb-2">Gaps to exploit</p>
+                    <ul className="space-y-2 text-sm text-foreground/70">
+                      {(strategyResult.report?.competitor_analysis?.gaps_to_exploit || []).slice(0, 4).map((item) => (
+                        <li key={item}>• {item}</li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
+                <div>
+                  <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground mb-2">Optimized prompt</p>
+                  <Textarea value={strategyResult.optimizedPrompt} readOnly className="min-h-[180px] text-sm" />
+                </div>
+              </div>
+            )}
             <GeneratedContent content={generatedContent} contentType={contentType}
               isLoading={isLoading} onRefine={handleRefine} isRefining={isRefining} />
           </div>

@@ -30,6 +30,8 @@ export interface BrandProfile {
   scraped_at: string;
   created_at: string;
   updated_at: string;
+  is_manual?: boolean;
+  website?: string | null;
 }
 
 interface ScanResult {
@@ -93,13 +95,22 @@ export function useBrandIntelligence() {
       const { data: { session } } = await supabase.auth.getSession();
       if (!session) return null;
 
-      const { data } = await supabase
-        .from('brand_profiles')
-        .select('*')
-        .eq('user_id', session.user.id)
-        .order('scraped_at', { ascending: false })
-        .limit(1)
-        .maybeSingle() as { data: BrandProfile | null };
+      // Prefer the account's active brand; fall back to the newest.
+      const { data: prof } = await (supabase
+        .from('profiles').select('active_brand_id').eq('id', session.user.id).maybeSingle() as any);
+      const activeId = (prof as any)?.active_brand_id as string | null;
+
+      let data: BrandProfile | null = null;
+      if (activeId) {
+        const r = await supabase.from('brand_profiles').select('*').eq('id', activeId).maybeSingle();
+        data = (r.data as BrandProfile) || null;
+      }
+      if (!data) {
+        const r = await supabase
+          .from('brand_profiles').select('*').eq('user_id', session.user.id)
+          .order('scraped_at', { ascending: false }).limit(1).maybeSingle();
+        data = (r.data as BrandProfile) || null;
+      }
 
       if (data) {
         setBrandProfile(data);

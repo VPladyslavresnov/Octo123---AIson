@@ -1,0 +1,91 @@
+# GMS On-Prem Analysis Agent — Docker Compose
+#
+# One command:  docker compose up
+# Open:         http://localhost:8501
+# Stop:         Ctrl-C  (or  docker compose down)
+#
+# First run downloads Ollama image + qwen3:14b (~9.3 GB) — subsequent starts are instant.
+# Model weights are stored in the named volume "ollama_models" and survive restarts.
+#
+# Security model:
+#   • The "internal" network has no internet route — containers can only reach each other.
+#   • The "pull" network exists only during the one-time model download; the app never
+#     touches it and it is not attached to the "app" service.
+#   • Uploaded files are processed in memory (BytesIO) — never written to host disk.
+#   • Ollama is hardcoded to localhost in the Python code; a guard raises on import if
+#     a non-local URL is set.
+#   • Streamlit telemetry is disabled via .streamlit/config.toml.
+#
+# GPU (NVIDIA CUDA) — uncomment the "deploy:" block under the ollama service.
+
+networks:
+  internal:
+    # No internet route — containers talk only to each other
+    internal: true
+  pull:
+    # Internet access for the one-time model pull only
+    internal: false
+
+services:
+
+  # ── Ollama inference server ──────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    networks:
+      - internal
+    volumes:
+      - ollama_models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:11434/api/tags"]
+      interval: 10s
+      timeout: 5s
+      retries: 18        # up to 3 min for cold start
+      start_period: 15s
+    restart: unless-stopped
+    # GPU support (NVIDIA) — uncomment if the host has a CUDA-capable GPU:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # ── Model pull (runs once; exits; internet access intentionally allowed here) ─
+  model-pull:
+    image: ollama/ollama:latest
+    networks:
+      - internal   # reaches the ollama service
+      - pull       # reaches the internet to download weights
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ollama_models:/root/.ollama
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen3:14b}   # override: OLLAMA_MODEL=gemma3:12b docker compose up
+    entrypoint: ["/bin/sh", "-c",
+      "ollama pull $OLLAMA_MODEL && echo 'Model ready.'"]
+    restart: "no"
+
+  # ── Streamlit app — internet-isolated at runtime ─────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    networks:
+      - internal   # can reach ollama; cannot reach the internet
+    ports:
+      - "8501:8501"    # only the browser port is exposed to the host
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    depends_on:
+      ollama:
+        condition: service_healthy
+      model-pull:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  ollama_models:

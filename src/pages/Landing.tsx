@@ -22,7 +22,7 @@ function useAuthNav() {
   }, []);
 
   const goApp = () => navigate(user ? "/content-studio" : "/signup");
-  const goLogin = () => navigate("/auth");
+  const goLogin = () => navigate("/auth?mode=login");
   return { user, goApp, goLogin };
 }
 

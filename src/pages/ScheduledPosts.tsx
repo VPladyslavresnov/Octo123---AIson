@@ -10,6 +10,7 @@ import { format, startOfMonth, endOfMonth, eachDayOfInterval, isSameDay, startOf
 import { DroppableDay } from "@/components/scheduled/DroppableDay";
 import { TimeSlotDialog } from "@/components/scheduled/TimeSlotDialog";
 import { ScheduledPost } from "@/components/scheduled/DraggablePost";
+import { getBypassRedirectTarget, shouldBypassAuth } from "@/lib/localAccessBypass";
 
 export default function ScheduledPosts() {
   const navigate = useNavigate();
@@ -31,7 +32,12 @@ export default function ScheduledPosts() {
   const checkAuth = async () => {
     const { data: { session } } = await supabase.auth.getSession();
     if (!session) {
-      navigate("/auth");
+      if (shouldBypassAuth()) {
+        setLoading(false);
+        setPosts([]);
+        return;
+      }
+      navigate(getBypassRedirectTarget());
       return;
     }
     loadScheduledPosts();
@@ -40,7 +46,10 @@ export default function ScheduledPosts() {
   const loadScheduledPosts = async () => {
     try {
       const { data: { user } } = await supabase.auth.getUser();
-      if (!user) return;
+      if (!user) {
+        setPosts([]);
+        return;
+      }
 
       const { data, error } = await supabase
         .from("scheduled_posts")

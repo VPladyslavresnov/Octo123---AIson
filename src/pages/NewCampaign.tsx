@@ -9,6 +9,8 @@ import { Progress } from "@/components/ui/progress";
 import { Badge } from "@/components/ui/badge";
 import { ArrowLeft, ArrowRight, Check, CheckCircle2, Sparkles } from "lucide-react";
 import { toast } from "sonner";
+import { runStrategyPreparation } from "@/lib/strategyFlow";
+import { getBypassRedirectTarget, shouldBypassAuth } from "@/lib/localAccessBypass";
 
 const STEPS = [
   { number: 1, label: "Campaign Basics" },
@@ -48,7 +50,8 @@ export default function NewCampaign() {
   const loadCompanyDetails = async () => {
     const { data: { session } } = await supabase.auth.getSession();
     if (!session) {
-      navigate("/auth");
+      if (shouldBypassAuth()) return;
+      navigate(getBypassRedirectTarget());
       return;
     }
 
@@ -91,7 +94,7 @@ export default function NewCampaign() {
         .from("campaigns")
         .insert({
           user_id: session.user.id,
-          objective: campaignName.trim(),
+          objective: goal,
           tone: tone.toLowerCase(),
           channels,
           duration_days: durationDays,
@@ -99,16 +102,51 @@ export default function NewCampaign() {
           brand_source_url: brandSourceUrl || null,
           status: "draft",
           content_mix: {
+            campaignName: campaignName.trim(),
             goal,
             companyName,
             targetAudience,
           },
-          key_offers_or_topics: targetAudience ? [targetAudience] : [],
+          key_offers_or_topics: [campaignName.trim(), ...(targetAudience ? [targetAudience] : [])],
         })
         .select()
         .single();
 
       if (error) throw error;
+
+      // Reward: creating a campaign unlocks the "Campaign Launcher" star.
+      window.dispatchEvent(new Event("aison:campaign-created"));
+
+      try {
+        const strategyPayload = await runStrategyPreparation({
+          sourcePrompt: [
+            `Campaign name: ${campaignName.trim()}`,
+            `Campaign goal: ${goal}`,
+            `Tone: ${tone}`,
+            `Channels: ${channels.join(", ")}`,
+            `Target audience: ${targetAudience || "not specified"}`,
+            `Duration: ${durationDays} days`,
+            `Cadence: ${cadence} posts per week`,
+          ].join("\n"),
+          requestedContentType: "campaign",
+          requestedGoal: goal,
+        });
+
+        await supabase
+          .from("campaigns")
+          .update({
+            brand_intelligence: {
+              strategy_prompt: strategyPayload.optimizedPrompt,
+              strategy_system_context: strategyPayload.optimizedSystemContext,
+              strategy_report: strategyPayload.report || null,
+              prompt_score: strategyPayload.score,
+              resolved_competitors: strategyPayload.resolvedCompetitors,
+            },
+          })
+          .eq("id", campaign.id);
+      } catch (strategyError) {
+        console.warn("Campaign strategy precomputation skipped:", strategyError);
+      }
 
       toast.success("Campaign created successfully");
       navigate(`/campaign/${campaign.id}`);

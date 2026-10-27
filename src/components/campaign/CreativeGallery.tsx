@@ -5,6 +5,8 @@ import { Card } from "@/components/ui/card";
 import { Sparkles, Heart, X, ChevronRight } from "lucide-react";
 import { toast } from "sonner";
 import { PresetPrompts, PresetType, presetPrompts, imagePresetPrompts } from "@/components/PresetPrompts";
+import { StrategyProgressFeed } from "@/components/StrategyProgressFeed";
+import { runStrategyPreparation, type StrategyProgressItem, type StrategyResult } from "@/lib/strategyFlow";
 
 interface CreativeGalleryProps {
   campaignId: string;
@@ -17,6 +19,8 @@ export function CreativeGallery({ campaignId }: CreativeGalleryProps) {
   const [loading, setLoading] = useState(true);
   const [selectedPreset, setSelectedPreset] = useState<PresetType>(null);
   const [batchInfo, setBatchInfo] = useState<{ totalPlanned: number; totalGenerated: number; hasMore: boolean; nextBatchIndex: number | null; channels: string[] } | null>(null);
+  const [strategySteps, setStrategySteps] = useState<StrategyProgressItem[]>([]);
+  const [strategyResult, setStrategyResult] = useState<StrategyResult | null>(null);
 
   useEffect(() => {
     loadCreatives();
@@ -41,16 +45,60 @@ export function CreativeGallery({ campaignId }: CreativeGalleryProps) {
 
   const handleGenerate = async () => {
     setIsGenerating(true);
+    setStrategySteps([]);
     try {
       const { data: { session } } = await supabase.auth.getSession();
       if (!session) throw new Error("Not authenticated");
 
       // Load preferred model from company details
-      const { data: company } = await supabase
+      const [{ data: company }, { data: campaign }] = await Promise.all([
+        supabase
         .from("company_details")
         .select("*")
         .eq("user_id", session.user.id)
-        .maybeSingle();
+        .maybeSingle(),
+        supabase.from("campaigns").select("*").eq("id", campaignId).single(),
+      ]);
+
+      const campaignPrompt = [
+        campaign?.objective ? `Campaign: ${campaign.objective}` : "",
+        (campaign as any)?.content_mix?.goal ? `Goal: ${(campaign as any).content_mix.goal}` : "",
+        campaign?.tone ? `Tone: ${campaign.tone}` : "",
+        campaign?.channels?.length ? `Channels: ${campaign.channels.join(", ")}` : "",
+        campaign?.key_offers_or_topics?.length ? `Topics: ${campaign.key_offers_or_topics.join(", ")}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      let strategyPayload: StrategyResult | null = null;
+      try {
+        strategyPayload = await runStrategyPreparation({
+          sourcePrompt: campaignPrompt || "Create a high-performing campaign content system",
+          requestedContentType: "campaign",
+          requestedGoal: campaignPrompt || "Campaign generation",
+          preferredModel: (company as any)?.preferred_model || undefined,
+          competitorInputs: [],
+          onProgress: setStrategySteps,
+        });
+        setStrategyResult(strategyPayload);
+
+        await supabase
+          .from("campaigns")
+          .update({
+            brand_intelligence: {
+              ...((campaign as any)?.brand_intelligence || {}),
+              strategy_prompt: strategyPayload.optimizedPrompt,
+              strategy_system_context: strategyPayload.optimizedSystemContext,
+              strategy_report: strategyPayload.report || null,
+              prompt_score: strategyPayload.score,
+              resolved_competitors: strategyPayload.resolvedCompetitors,
+            },
+          })
+          .eq("id", campaignId);
+      } catch (strategyError) {
+        console.warn("Campaign strategy fallback:", strategyError);
+        setStrategyResult(null);
+      }
 
       // Generate next batch (default 5 posts) — channel-adapted
       const { data, error } = await supabase.functions.invoke("generate-campaign-content", {
@@ -60,21 +108,33 @@ export function CreativeGallery({ campaignId }: CreativeGalleryProps) {
           presetPrompt: selectedPreset ? presetPrompts[selectedPreset] : null,
           imagePresetPrompt: selectedPreset ? imagePresetPrompts[selectedPreset] : null,
           preferredModel: (company as any)?.preferred_model || undefined,
+          strategyPrompt: strategyPayload?.optimizedPrompt || null,
+          strategySystemContext: strategyPayload?.optimizedSystemContext || null,
           batchSize: 5,
           batchIndex: batchInfo?.nextBatchIndex ?? 0,
         }
       });
 
-      if (error) throw error;
+      if (error) {
+        // Surface the backend's real message (e.g. AI not configured) instead of a generic one.
+        let serverMsg = "";
+        try { serverMsg = (await (error as any)?.context?.json?.())?.error || ""; } catch { /* ignore */ }
+        throw new Error(serverMsg || (error as Error).message);
+      }
 
       if (data?.batchInfo) setBatchInfo(data.batchInfo);
+      const generated = data?.count || 0;
+      if (generated === 0) {
+        toast.error("No posts were generated. Check that an AI provider is configured (Account → API Keys), then try again.");
+        return;
+      }
       const remaining = data?.batchInfo?.hasMore
         ? `${data.batchInfo.totalGenerated}/${data.batchInfo.totalPlanned} done — generate next batch when ready.`
         : `All ${data?.batchInfo?.totalGenerated || data?.count} posts generated!`;
-      toast.success(`Batch ready: ${data?.count || 0} new creatives. ${remaining}`);
+      toast.success(`Batch ready: ${generated} new creatives. ${remaining}`);
       loadCreatives();
     } catch (error) {
-      toast.error("Content generation failed. Please try again in a moment.");
+      toast.error(error instanceof Error && error.message ? error.message : "Content generation failed. Please try again in a moment.");
     } finally {
       setIsGenerating(false);
     }
@@ -145,6 +205,26 @@ export function CreativeGallery({ campaignId }: CreativeGalleryProps) {
           <p className="text-sm text-muted-foreground mb-3 text-center">Select a content style:</p>
           <PresetPrompts selectedPreset={selectedPreset} onSelectPreset={setSelectedPreset} />
         </div>
+
+        {(isGenerating || strategySteps.length > 0) && (
+          <StrategyProgressFeed title="Campaign generation flow" steps={strategySteps} compact />
+        )}
+
+        {strategyResult && !isGenerating && (
+          <Card className="p-4">
+            <div className="flex items-center justify-between gap-3 mb-2">
+              <p className="text-sm font-semibold text-foreground/80">Campaign strategy ready</p>
+              {strategyResult.score != null && (
+                <span className="rounded-full bg-primary/10 px-2.5 py-1 text-xs font-semibold text-primary">
+                  {strategyResult.score}% score
+                </span>
+              )}
+            </div>
+            <p className="text-sm text-muted-foreground">
+              {strategyResult.report?.strategy?.recommended_angle || "AIson prepared a strategy-led generation prompt for this campaign."}
+            </p>
+          </Card>
+        )}
       </div>
 
       {loading ? (

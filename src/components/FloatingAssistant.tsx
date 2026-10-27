@@ -1,9 +1,10 @@
 import { useState, useRef, useEffect } from "react";
 import { useLocation } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
-import { MessageCircle, X, Send, Sparkles, Loader2, Bot } from "lucide-react";
+import { X, Send, Sparkles, Loader2, Bot } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
-import ReactMarkdown from "react-markdown";
+import { Mascot } from "@/components/Mascot";
+import { RichMessage } from "@/components/RichMessage";
 
 interface Message {
   id: string;
@@ -78,19 +79,9 @@ export function FloatingAssistant() {
 
   return (
     <>
-      {/* Floating button */}
+      {/* Floating mascot (opens the assistant) */}
       <AnimatePresence>
-        {!open && (
-          <motion.button
-            initial={{ scale: 0 }}
-            animate={{ scale: 1 }}
-            exit={{ scale: 0 }}
-            onClick={() => setOpen(true)}
-            className="fixed bottom-6 right-6 z-50 w-14 h-14 rounded-full bg-primary text-primary-foreground shadow-[0_0_24px_hsl(var(--primary)/0.4)] hover:scale-105 transition-transform flex items-center justify-center"
-          >
-            <MessageCircle className="w-6 h-6" />
-          </motion.button>
-        )}
+        {!open && <Mascot onClick={() => setOpen(true)} />}
       </AnimatePresence>
 
       {/* Chat panel */}
@@ -134,9 +125,7 @@ export function FloatingAssistant() {
                       : "bg-muted text-foreground rounded-bl-sm"
                   }`}>
                     {m.role === "assistant" ? (
-                      <div className="prose prose-sm prose-invert max-w-none [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
-                        <ReactMarkdown>{m.content}</ReactMarkdown>
-                      </div>
+                      <RichMessage content={m.content} compact analyticsQuery={[...messages].reverse().find((mm) => mm.role === "user")?.content} />
                     ) : m.content}
                   </div>
                 </div>

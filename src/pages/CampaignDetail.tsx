@@ -79,7 +79,10 @@ export default function CampaignDetail() {
     y: Math.floor(80 + Math.random() * 200),
   }));
 
-  const title = campaign.objective
+  const campaignName = campaign.content_mix?.campaignName || null;
+  const title = campaignName
+    ? campaignName
+    : campaign.objective
     ? campaign.objective.charAt(0).toUpperCase() + campaign.objective.slice(1)
     : "Campaign";
 

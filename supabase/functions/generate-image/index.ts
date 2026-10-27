@@ -1,8 +1,9 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.7.1";
+import { resolveImageKey } from "../_shared/openai.ts";
+import { hasHiggsfield, higgsfieldEnqueue } from "../_shared/higgsfield.ts";
 
 const DEFAULT_MODEL = "openai/gpt-5";
-const DEFAULT_GATEWAY_IMAGE_MODEL = "google/gemini-2.5-flash-image";
 
 const DIRECT_OPENAI_MODELS = new Set(["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo", "dall-e-3"]);
 
@@ -80,21 +81,6 @@ async function callXAIImage(prompt: string, xaiKey: string) {
   });
 }
 
-async function callGatewayImage(prompt: string, model: string, lovableKey: string) {
-  return await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${lovableKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      messages: [{ role: "user", content: prompt }],
-      modalities: ["image", "text"],
-    }),
-  });
-}
-
 serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
@@ -111,10 +97,7 @@ serve(async (req) => {
 
     const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
     const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY");
-    const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
-    const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY");
-
-    if (!LOVABLE_API_KEY || !SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
       console.error("Missing required environment variables");
       return new Response(JSON.stringify({ error: "Service temporarily unavailable" }), {
         status: 500,
@@ -137,6 +120,7 @@ serve(async (req) => {
     }
 
     const userId = claimsData.claims.sub;
+    const OPENAI_API_KEY = await resolveImageKey(userId);
 
     const { prompt, companyDetails, preferredModel, systemPrompt, brandProfile } = await req.json();
 
@@ -147,7 +131,7 @@ serve(async (req) => {
       });
     }
 
-    const sanitizedPrompt = prompt.trim().slice(0, 2000);
+    const sanitizedPrompt = prompt.trim().slice(0, 3000);
 
     // For image generation, keep the prompt concise. Image models work best with
     // short, descriptive prompts rather than long rule-based instructions.
@@ -185,20 +169,25 @@ serve(async (req) => {
 
     enrichedPrompt += sanitizedPrompt;
 
-    // Keep total prompt under 1500 chars for image models
-    enrichedPrompt = enrichedPrompt.slice(0, 1500);
+    // Keep image prompts focused, while allowing the orchestrator's visual brief.
+    enrichedPrompt = enrichedPrompt.slice(0, 3200);
 
     const selectedModel = normalizeModel(preferredModel);
     console.log("Generating image for user:", userId, "model:", selectedModel);
 
-    if (isDirectOpenAIModel(selectedModel) && !OPENAI_API_KEY) {
-      return new Response(JSON.stringify({ error: "OpenAI is not configured on this backend yet." }), {
-        status: 500,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+    // Primary image provider: Higgsfield (via bridge, fire-and-forget → Library).
+    if (hasHiggsfield()) {
+      const ok = await higgsfieldEnqueue("image", enrichedPrompt, userId, { aspectRatio: "1:1", caption: sanitizedPrompt });
+      if (ok) {
+        return new Response(JSON.stringify({
+          pending: true, provider: "higgsfield",
+          message: "Generating your image with Higgsfield — it'll appear in your Library in a minute or two.",
+        }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      }
+      console.warn("Higgsfield enqueue failed, falling back.");
     }
 
-    if (isDirectOpenAIModel(selectedModel) && OPENAI_API_KEY) {
+    if (OPENAI_API_KEY) {
       const dalleResponse = await callOpenAIImage(enrichedPrompt, OPENAI_API_KEY);
 
       if (dalleResponse.ok) {
@@ -281,51 +270,13 @@ serve(async (req) => {
       }
     }
 
-    // Fallback to gateway
-    const gatewayModel = DEFAULT_GATEWAY_IMAGE_MODEL;
-    const response = await callGatewayImage(enrichedPrompt, gatewayModel, LOVABLE_API_KEY);
-
-    if (!response.ok) {
-      const gatewayErrorText = await response.text();
-      const providerMessage = getProviderErrorMessage(gatewayErrorText);
-      console.error("AI gateway error:", response.status, providerMessage || gatewayErrorText);
-
-      if (response.status === 429) {
-        return new Response(JSON.stringify({ error: "Rate limit exceeded. Please try again later." }), {
-          status: 429,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
-      if (response.status === 402) {
-        return new Response(JSON.stringify({ error: "Payment required. Please add credits to continue." }), {
-          status: 402,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
-      return new Response(
-        JSON.stringify({ error: providerMessage || "Failed to generate image. Please try again." }),
-        {
-          status: 502,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        },
-      );
-    }
-
-    const data = await response.json();
-    const imageUrl = data?.choices?.[0]?.message?.images?.[0]?.image_url?.url;
-
-    if (!imageUrl) {
-      return new Response(JSON.stringify({ error: "No image generated. Please try again." }), {
-        status: 500,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
-
-    console.log("Gateway image generation successful for user:", userId);
-
-    return new Response(JSON.stringify({ url: imageUrl, imageUrl }), {
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    return new Response(
+      JSON.stringify({
+        error:
+          "Image generation is not configured. Add your OpenAI API key in Account → API Keys (or set the OPENAI_API_KEY backend secret).",
+      }),
+      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+    );
   } catch (error) {
     console.error("Error in generate-image:", error);
     return new Response(JSON.stringify({ error: "An unexpected error occurred. Please try again." }), {

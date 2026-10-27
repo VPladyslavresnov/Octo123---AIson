@@ -1,0 +1,27 @@
+name: Supabase keep-alive
+
+# Supabase's free tier pauses a project after ~7 days with no activity.
+# This runs a tiny DB query every 3 days so the project never goes idle.
+# (It does NOT un-pause an already-paused project — restore that once from the
+#  dashboard; after that this keeps it awake for free.)
+
+on:
+  schedule:
+    - cron: "0 6 */3 * *" # every 3 days at 06:00 UTC
+  workflow_dispatch: {}    # allows running it manually from the Actions tab
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Query the database to keep it active
+        run: |
+          code=$(curl -sS -o /dev/null -w "%{http_code}" \
+            "https://rumhrujisuqumcbeusny.supabase.co/rest/v1/company_details?select=id&limit=1" \
+            -H "apikey: sb_publishable_y9jfZ6KYkw4pWcYPHtDcvw_0GoQ1yT7")
+          echo "Supabase REST responded: $code"
+          # 200 (rows) or 206/416 are all fine — the project answered, so it's awake.
+          if [ "$code" = "000" ]; then
+            echo "::error::Supabase did not respond — the project may be paused; restore it from the dashboard."
+            exit 1
+          fi

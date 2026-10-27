@@ -1,11 +1,13 @@
 import "https://deno.land/x/xhr@0.1.0/mod.ts";
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.7.1";
+import { claudeChatCompletion, hasClaude } from "../_shared/claude.ts";
+import { noProviderResponse, openaiChatCompletion, resolveOpenAIKey } from "../_shared/openai.ts";
 
 const DEFAULT_MODEL = "openai/gpt-5";
 const OPENAI_FALLBACK_MODEL = "gpt-4o-mini";
 
-const DIRECT_OPENAI_MODELS = new Set(["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"]);
+const DIRECT_OPENAI_MODELS = new Set<string>(); // routed through shared provider (Groq/Llama)
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -108,8 +110,18 @@ async function callOpenAI(prompt: string, modelName: string, openaiKey: string) 
   });
 }
 
-async function callAI(prompt: string, model: string, lovableKey: string, openaiKey: string | null) {
+async function callAI(prompt: string, model: string, openaiKey: string | null) {
   const normalizedModel = normalizeModel(model);
+
+  // All AI chat/text goes through Claude when configured
+  if (hasClaude()) {
+    const response = await claudeChatCompletion({
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+    });
+    if (response.ok) return response;
+    console.warn("Claude failed, falling back:", response.status);
+  }
 
   if (isDirectOpenAIModel(normalizedModel) && openaiKey) {
     let openaiModel = getOpenAIModelName(normalizedModel);
@@ -124,17 +136,15 @@ async function callAI(prompt: string, model: string, lovableKey: string, openaiK
     return response;
   }
 
-  return await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${lovableKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: normalizedModel || DEFAULT_MODEL,
+  if (openaiKey) {
+    return await openaiChatCompletion(openaiKey, {
+      model: normalizedModel,
       messages: [{ role: "user", content: prompt }],
-    }),
-  });
+      response_format: { type: "json_object" },
+    });
+  }
+
+  return noProviderResponse();
 }
 
 function toStringArray(value: unknown): string[] {
@@ -158,11 +168,9 @@ serve(async (req) => {
 
     const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
     const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY");
-    const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
     const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-    const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY");
 
-    if (!LOVABLE_API_KEY || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !SUPABASE_ANON_KEY) {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !SUPABASE_ANON_KEY) {
       console.error("Missing required environment variables");
       return new Response(JSON.stringify({ error: "Service temporarily unavailable" }), {
         status: 500,
@@ -185,6 +193,7 @@ serve(async (req) => {
     }
 
     const userId = claimsData.claims.sub;
+    const OPENAI_API_KEY = await resolveOpenAIKey(userId);
 
     const { campaignId } = await req.json();
 
@@ -227,7 +236,7 @@ serve(async (req) => {
 
     console.log("Analyzing trends for user:", userId, "model:", selectedModel);
 
-    const aiResponse = await callAI(trendPrompt, selectedModel, LOVABLE_API_KEY, OPENAI_API_KEY || null);
+    const aiResponse = await callAI(trendPrompt, selectedModel, OPENAI_API_KEY);
 
     if (!aiResponse.ok) {
       const errorText = await aiResponse.text();

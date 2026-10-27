@@ -34,6 +34,10 @@ interface CampaignMenuProps {
     id: string;
     objective: string | null;
     brand_source_url: string | null;
+    content_mix?: {
+      campaignName?: string;
+      [key: string]: unknown;
+    } | null;
   };
   onUpdate: () => void;
 }
@@ -41,7 +45,7 @@ interface CampaignMenuProps {
 export function CampaignMenu({ campaign, onUpdate }: CampaignMenuProps) {
   const [showEditDialog, setShowEditDialog] = useState(false);
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
-  const [objective, setObjective] = useState(campaign.objective || "");
+  const [objective, setObjective] = useState(campaign.content_mix?.campaignName || campaign.objective || "");
   const [brandUrl, setBrandUrl] = useState(campaign.brand_source_url || "");
   const [isLoading, setIsLoading] = useState(false);
 
@@ -51,7 +55,10 @@ export function CampaignMenu({ campaign, onUpdate }: CampaignMenuProps) {
       const { error } = await supabase
         .from("campaigns")
         .update({
-          objective,
+          content_mix: {
+            ...(campaign.content_mix || {}),
+            campaignName: objective,
+          },
           brand_source_url: brandUrl,
         })
         .eq("id", campaign.id);

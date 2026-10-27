@@ -1,0 +1,63 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Connect AIson to Claude</title>
+<style>
+:root{--canvas:#0e0f13;--surface:#171922;--sep:#272a38;--ink:#f0f1f5;--ink2:#9aa0b4;--ink3:#666c80;--accent:#6d5df6;--accent2:#7f70ff}
+*{box-sizing:border-box}
+body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:var(--canvas);color:var(--ink);display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px}
+.card{background:var(--surface);border:1px solid var(--sep);border-radius:12px;padding:36px;max-width:380px;width:100%;box-shadow:0 4px 24px rgba(0,0,0,.45)}
+.brand{width:48px;height:48px;border-radius:12px;background:linear-gradient(135deg,#6d5df6,#4636c9);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:22px;margin:0 auto 16px}
+h1{font-size:22px;text-align:center;margin:0 0 6px}
+p{font-size:13.5px;color:var(--ink2);text-align:center;margin:0 0 22px;line-height:1.5}
+label{display:block;font-size:12px;font-weight:600;color:var(--ink2);margin:12px 0 5px}
+input{width:100%;padding:11px 13px;border:1px solid var(--sep);border-radius:10px;font-size:15px;background:var(--canvas);color:var(--ink)}
+input:focus{outline:none;border-color:rgba(109,93,246,.7);box-shadow:0 0 0 3px rgba(109,93,246,.18)}
+button{width:100%;margin-top:20px;padding:12px;background:var(--accent);color:#fff;border:none;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer;font-family:inherit}
+button:hover{background:var(--accent2)}
+button:disabled{opacity:.6;cursor:default}
+.err{color:#e06c75;font-size:13px;text-align:center;margin-top:12px;min-height:16px}
+.hint{font-size:11.5px;color:var(--ink3);text-align:center;margin-top:16px;line-height:1.5}
+</style></head><body>
+<div class="card">
+  <div class="brand">A</div>
+  <h1>Connect AIson to Claude</h1>
+  <p>Sign in with your AIson account to let Claude create on-brand content and answer questions from your AIson workspace.</p>
+  <form id="f">
+    <label>Email</label>
+    <input type="email" id="email" placeholder="you@company.com" autocomplete="username" required>
+    <label>Password</label>
+    <input type="password" id="password" placeholder="your AIson password" autocomplete="current-password" required>
+    <button type="submit" id="btn">Allow access &rarr;</button>
+    <div class="err" id="err"></div>
+  </form>
+  <div class="hint">No account yet? Open the AIson app and sign up first, then come back here.</div>
+</div>
+<script>
+const MCP_BASE = "https://rumhrujisuqumcbeusny.supabase.co/functions/v1/mcp";
+const qs = new URLSearchParams(location.search);
+document.getElementById("f").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const btn = document.getElementById("btn");
+  const err = document.getElementById("err");
+  err.textContent = ""; btn.disabled = true; btn.textContent = "Signing in…";
+  try {
+    const r = await fetch(MCP_BASE + "/authorize", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: document.getElementById("email").value.trim(),
+        password: document.getElementById("password").value,
+        redirect_uri: qs.get("redirect_uri") || "",
+        state: qs.get("state") || "",
+        code_challenge: qs.get("code_challenge") || "",
+      }),
+    });
+    const d = await r.json();
+    if (d.redirect) { location.href = d.redirect; return; }
+    err.textContent = d.error || "Something went wrong. Try again.";
+  } catch {
+    err.textContent = "Connection error. Try again.";
+  }
+  btn.disabled = false; btn.textContent = "Allow access →";
+});
+</script>
+</body></html>

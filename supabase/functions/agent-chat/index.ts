@@ -1,5 +1,24 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
+import { claudeChatCompletion, hasClaude } from "../_shared/claude.ts";
+import { noProviderResponse, openaiChatCompletion, openaiImageUrl, resolveImageKey, resolveOpenAIKey } from "../_shared/openai.ts";
+import { generateVargVideo, resolveVargKey } from "../_shared/varg.ts";
+import { hasHiggsfield, higgsfieldEnqueue } from "../_shared/higgsfield.ts";
+
+// Claude when configured on the backend, otherwise OpenAI (backend secret or
+// the user's own key from Account → API Keys).
+async function chatAI(
+  body: { messages: unknown[]; tools?: unknown[] },
+  openaiKey: string | null,
+): Promise<Response> {
+  if (hasClaude()) {
+    return await claudeChatCompletion(body as Parameters<typeof claudeChatCompletion>[0]);
+  }
+  if (openaiKey) {
+    return await openaiChatCompletion(openaiKey, body as Parameters<typeof openaiChatCompletion>[1]);
+  }
+  return noProviderResponse();
+}
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -160,6 +179,57 @@ const tools = [
   },
 ];
 
+function normalizeCampaignGoal(input: unknown): string {
+  const value = String(input || "").toLowerCase();
+  if (value.includes("lead")) return "leads";
+  if (value.includes("sale") || value.includes("conversion")) return "sales";
+  if (value.includes("traffic") || value.includes("website")) return "traffic";
+  if (value.includes("engage") || value.includes("community")) return "engagement";
+  return "awareness";
+}
+
+function inferChannelFromPrompt(prompt: string): string {
+  const value = prompt.toLowerCase();
+  if (value.includes("linkedin")) return "linkedin";
+  if (value.includes("facebook") || value.includes("meta")) return "facebook";
+  if (value.includes("tiktok")) return "tiktok";
+  if (value.includes("twitter") || value.includes("x ")) return "twitter";
+  return "instagram";
+}
+
+function inferToneFromPrompt(prompt: string): string {
+  const value = prompt.toLowerCase();
+  if (value.includes("premium")) return "premium";
+  if (value.includes("playful")) return "playful";
+  if (value.includes("bold")) return "bold";
+  if (value.includes("casual")) return "casual";
+  if (value.includes("educational")) return "educational";
+  return "professional";
+}
+
+function isCampaignRequest(prompt: string): boolean {
+  const value = prompt.toLowerCase();
+  return /\b(campaign)\b/.test(value) && /\b(create|launch|start|new|generate)\b/.test(value);
+}
+
+function isContentGenerationRequest(prompt: string): boolean {
+  const value = prompt.toLowerCase();
+  return /\b(create|generate|write|make|draft)\b/.test(value) && /\b(post|content|caption|ad|visual|image|video)\b/.test(value);
+}
+
+function inferVisualType(prompt: string): "image" | "video" {
+  const value = prompt.toLowerCase();
+  return value.includes("video") || value.includes("reel") ? "video" : "image";
+}
+
+function safeJsonParse<T>(value: string, fallback: T): T {
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
+}
+
 // Execute tool calls against the database
 async function executeTool(
   toolName: string,
@@ -252,13 +322,21 @@ async function executeTool(
         return JSON.stringify({ success: true, updated: data });
       }
       case "create_campaign": {
+        const rawObjective = String(args.objective || "").trim();
         const { data, error } = await supabaseAdmin.from("campaigns").insert({
           user_id: userId,
-          objective: args.objective as string,
+          objective: normalizeCampaignGoal(args.objective),
           channels: (args.channels as string[]) || ["instagram"],
           tone: (args.tone as string) || "professional",
           duration_days: (args.duration_days as number) || 30,
-          key_offers_or_topics: (args.key_offers_or_topics as string[]) || [],
+          key_offers_or_topics: [
+            ...(((args.key_offers_or_topics as string[]) || [])),
+            ...(rawObjective ? [rawObjective] : []),
+          ].slice(0, 8),
+          content_mix: {
+            goal: normalizeCampaignGoal(args.objective),
+            campaignName: rawObjective || "New campaign",
+          },
           status: "active",
         }).select().single();
         if (error) return JSON.stringify({ error: error.message });
@@ -297,24 +375,20 @@ async function executeTool(
         const channel = (args.channel as string) || "instagram";
         const visualType = ((args.visual_type as string) || "image").toLowerCase();
         const prompt = args.prompt as string;
-        const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY")!;
+        const OPENAI_KEY = await resolveOpenAIKey(userId);
+        const IMAGE_KEY = await resolveImageKey(userId);
 
         // Generate text content (caption + hashtags + CTA)
-        const textRes = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-          method: "POST",
-          headers: { Authorization: `Bearer ${LOVABLE_API_KEY}`, "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: "google/gemini-3-flash-preview",
-            messages: [
-              {
-                role: "system",
-                content: `You are a social media copywriter. Generate a ${channel} post. ${brandContext} ${companyContext}
+        const textRes = await chatAI({
+          messages: [
+            {
+              role: "system",
+              content: `You are a social media copywriter. Generate a ${channel} post. ${brandContext} ${companyContext}
 Tone: ${tone}. Return ONLY valid JSON: {"caption":"...","hashtags":["..."],"cta":"..."}`
-              },
-              { role: "user", content: prompt }
-            ],
-          }),
-        });
+            },
+            { role: "user", content: prompt }
+          ],
+        }, OPENAI_KEY);
         const textData = await textRes.json();
         let postContent = { caption: "", hashtags: [] as string[], cta: "" };
         try {
@@ -340,49 +414,64 @@ Tone: ${tone}. Return ONLY valid JSON: {"caption":"...","hashtags":["..."],"cta"
             ];
 
         const variants: Array<{ url: string | null; style: string; script?: string }> = [];
+        let hfPending = false;
 
         if (visualType === "video") {
-          // 3 video script variants (lightweight; full video gen happens via separate flow)
-          for (let i = 0; i < 3; i++) {
-            try {
-              const scriptRes = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-                method: "POST",
-                headers: { Authorization: `Bearer ${LOVABLE_API_KEY}`, "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  model: "google/gemini-3-flash-preview",
+          const videoPrompt = [
+            prompt,
+            brandContext,
+            `Create a polished ${channel} social video: clear motion, premium composition, platform-native pacing.`,
+          ].filter(Boolean).join("\n\n");
+          // Primary: Higgsfield (async → saved to the user's Library when ready).
+          if (hasHiggsfield()) {
+            hfPending = await higgsfieldEnqueue("video", videoPrompt, userId, { aspectRatio: "9:16", caption: prompt });
+          }
+          // Fallback: VargAI (synchronous).
+          if (!hfPending && !variants.length) {
+            const vargKey = await resolveVargKey(userId);
+            if (vargKey) {
+              try {
+                const varg = await generateVargVideo({ prompt: videoPrompt, apiKey: vargKey, aspectRatio: "9:16" });
+                if (varg?.url) variants.push({ url: varg.url, style: "VargAI cinematic" });
+              } catch (e) {
+                console.warn("Varg video generation failed in chat:", e);
+              }
+            }
+          }
+          // If nothing else, short script drafts.
+          if (!hfPending && !variants.length) {
+            for (let i = 0; i < 3; i++) {
+              try {
+                const scriptRes = await chatAI({
                   messages: [
                     { role: "system", content: `You write short 15-second ${channel} video scripts. Style: ${styleAngles[i]}. ${brandContext}. Return only the script — scene-by-scene, max 80 words.` },
                     { role: "user", content: prompt },
                   ],
-                }),
-              });
-              const sd = await scriptRes.json();
-              const script = sd.choices?.[0]?.message?.content || "";
-              variants.push({ url: null, style: styleAngles[i], script });
-            } catch { /* skip */ }
+                }, OPENAI_KEY);
+                const sd = await scriptRes.json();
+                const script = sd.choices?.[0]?.message?.content || "";
+                variants.push({ url: null, style: styleAngles[i], script });
+              } catch { /* skip */ }
+            }
           }
         } else {
-          // 3 image variants in parallel
-          const imagePromises = styleAngles.map((style) =>
-            fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-              method: "POST",
-              headers: { Authorization: `Bearer ${LOVABLE_API_KEY}`, "Content-Type": "application/json" },
-              body: JSON.stringify({
-                model: "google/gemini-2.5-flash-image",
-                messages: [
-                  { role: "user", content: `Create a ${channel} social media visual for: ${prompt}${colorHint}. Style: ${style}. Modern, professional.` }
-                ],
-                modalities: ["image", "text"],
-              }),
-            }).then(r => r.json()).catch(() => null)
-          );
-          const imageResults = await Promise.all(imagePromises);
-          imageResults.forEach((imgData, i) => {
-            const url = imgData?.choices?.[0]?.message?.images?.[0]?.image_url?.url;
-            if (url) variants.push({ url, style: styleAngles[i] });
-          });
+          // Images — Higgsfield primary (async → Library), OpenAI DALL-E fallback (inline).
+          if (hasHiggsfield()) {
+            hfPending = await higgsfieldEnqueue("image", `Create a ${channel} social media visual for: ${prompt}${colorHint}. Modern, professional.`, userId, { aspectRatio: "1:1", caption: prompt });
+          } else if (IMAGE_KEY) {
+            const imageResults = await Promise.all(styleAngles.map((style) =>
+              openaiImageUrl(IMAGE_KEY, `Create a ${channel} social media visual for: ${prompt}${colorHint}. Style: ${style}. Modern, professional.`)
+            ));
+            imageResults.forEach((url, i) => { if (url) variants.push({ url, style: styleAngles[i] }); });
+          }
         }
 
+        const marker = variants.length
+          ? ` Then APPEND this exact marker on its own line at the end so the UI can render the gallery picker: <<VARIANTS:${JSON.stringify(variants)}>>`
+          : "";
+        const pendingNote = hfPending
+          ? `The ${visualType} is being generated with Higgsfield and will appear in the user's Library in a minute or two. Tell them that clearly.`
+          : "";
         return JSON.stringify({
           generated: true,
           caption: postContent.caption,
@@ -392,7 +481,8 @@ Tone: ${tone}. Return ONLY valid JSON: {"caption":"...","hashtags":["..."],"cta"
           tone,
           visual_type: visualType,
           variants,
-          message: `Generated ${variants.length} ${visualType} options. Present a brief intro, the caption, and hashtags. Then APPEND this exact marker on its own line at the end so the UI can render the gallery picker: <<VARIANTS:${JSON.stringify(variants)}>>`
+          pending: hfPending,
+          message: `Generated a ${channel} post caption + hashtags. ${pendingNote} Present a brief intro, the caption, and hashtags.${marker}`
         });
       }
       case "save_creative": {
@@ -427,6 +517,107 @@ Tone: ${tone}. Return ONLY valid JSON: {"caption":"...","hashtags":["..."],"cta"
   }
 }
 
+// Prefetch a compact snapshot of the user's workspace so the assistant is always
+// grounded in their real brand, data and strategy — not guessing.
+async function loadWorkspaceContext(userId: string, admin: any): Promise<string> {
+  const safe = async <T>(p: Promise<T>, fb: T): Promise<T> => { try { return await p; } catch { return fb; } };
+  const dataOf = (r: any) => (r && "data" in r ? r.data : null);
+
+  const [companyR, profileR, campaignsR, savedR, totalR, schedR, reportR] = await Promise.all([
+    safe(admin.from("company_details").select("*").eq("user_id", userId).maybeSingle(), { data: null }),
+    safe(admin.from("profiles").select("active_brand_id, full_name").eq("id", userId).maybeSingle(), { data: null }),
+    safe(admin.from("campaigns").select("name,status,objective,created_at").eq("user_id", userId).order("created_at", { ascending: false }).limit(6), { data: [] }),
+    safe(admin.from("creatives").select("id", { count: "exact", head: true }).eq("user_id", userId).eq("saved", true), { count: 0 }),
+    safe(admin.from("creatives").select("id", { count: "exact", head: true }).eq("user_id", userId), { count: 0 }),
+    safe(admin.from("scheduled_posts").select("id", { count: "exact", head: true }).eq("user_id", userId).eq("status", "scheduled"), { count: 0 }),
+    safe(admin.from("strategy_reports").select("title,research_report,prompt_score,resolved_competitors,created_at").eq("user_id", userId).order("created_at", { ascending: false }).limit(1).maybeSingle(), { data: null }),
+  ]);
+
+  const company: any = dataOf(companyR);
+  const profile: any = dataOf(profileR);
+  let brand: any = null;
+  const activeId = profile?.active_brand_id;
+  if (activeId) brand = dataOf(await safe(admin.from("brand_profiles").select("*").eq("id", activeId).maybeSingle(), { data: null }));
+  if (!brand) brand = dataOf(await safe(admin.from("brand_profiles").select("*").eq("user_id", userId).order("scraped_at", { ascending: false }).limit(1).maybeSingle(), { data: null }));
+
+  const campaigns: any[] = (campaignsR as any)?.data || [];
+  const report: any = dataOf(reportR);
+
+  const lines: string[] = [];
+  const name = brand?.brand_name || company?.company_name;
+  const industry = brand?.industry || company?.business_type;
+  if (name) lines.push(`- Business: **${name}**${industry ? ` (${industry})` : ""}`);
+  const audience = brand?.target_audience_signals || company?.target_audience;
+  if (audience) lines.push(`- Target audience: ${audience}`);
+  const location = brand?.location || company?.location;
+  if (location) lines.push(`- Location: ${location}`);
+  if (brand?.tone_of_voice) lines.push(`- Brand tone: ${brand.tone_of_voice}`);
+  if (brand?.visual_style) lines.push(`- Visual style: ${brand.visual_style}`);
+  const colors = [...(brand?.primary_colors || []), ...(brand?.secondary_colors || [])].filter(Boolean).slice(0, 4);
+  if (colors.length) lines.push(`- Brand colours: ${colors.join(", ")}`);
+  lines.push(campaigns.length
+    ? `- Campaigns (${campaigns.length}): ${campaigns.map((c) => `${c.name || "Untitled"} [${c.status || "?"}]`).join("; ")}`
+    : `- Campaigns: none yet`);
+  lines.push(`- Library: ${(totalR as any)?.count ?? 0} creatives (${(savedR as any)?.count ?? 0} saved) · ${(schedR as any)?.count ?? 0} scheduled posts`);
+
+  if (report?.research_report) {
+    const r = report.research_report || {};
+    const strat = r.strategy || {};
+    const comp = r.competitor_analysis || {};
+    lines.push(`- MARKETING STRATEGY REPORT on file${report.prompt_score ? ` (quality ${report.prompt_score}/100)` : ""} — use it:`);
+    if (strat.recommended_angle) lines.push(`    • Recommended angle: ${strat.recommended_angle}`);
+    if (Array.isArray(strat.recommended_hooks) && strat.recommended_hooks.length) lines.push(`    • Hooks that work: ${strat.recommended_hooks.slice(0, 4).join("; ")}`);
+    if (Array.isArray(strat.recommended_formats) && strat.recommended_formats.length) lines.push(`    • Best formats: ${strat.recommended_formats.slice(0, 4).join(", ")}`);
+    if (Array.isArray(comp.patterns_to_emulate) && comp.patterns_to_emulate.length) lines.push(`    • Competitor patterns to emulate: ${comp.patterns_to_emulate.slice(0, 3).join("; ")}`);
+    if (Array.isArray(comp.gaps_to_exploit) && comp.gaps_to_exploit.length) lines.push(`    • Gaps to exploit: ${comp.gaps_to_exploit.slice(0, 3).join("; ")}`);
+  } else {
+    lines.push(`- No marketing strategy report yet — proactively offer to build one (it analyses their brand + real competitors and makes every campaign sharper).`);
+  }
+
+  // Setup completeness — used to gate content generation (see guardrails in prompt).
+  const hasBrand = !!(brand && brand.brand_name);
+  const hasColors = !!(brand && Array.isArray(brand.primary_colors) && brand.primary_colors.length);
+  const hasReport = !!report?.research_report;
+  const missing: string[] = [];
+  if (!hasBrand) missing.push("a brand profile");
+  if (!hasColors) missing.push("brand colours");
+  if (!hasReport) missing.push("a competitor/strategy report");
+  const setupComplete = hasBrand && hasColors && hasReport;
+  lines.push(setupComplete
+    ? `- SETUP STATUS: COMPLETE — brand, colours and strategy report are all in place. You fully understand this brand; generate confidently and on-brand.`
+    : `- SETUP STATUS: INCOMPLETE — still missing ${missing.join(", ")}. Before generating polished content, briefly help them finish setup (scan/confirm the brand on the Brands page, set colours, and build the strategy report). You may still advise and plan in chat.`);
+
+  return lines.length ? lines.join("\n") : "(Brand-new account with no data yet — help them finish onboarding: set up their brand and build a strategy report before generating content.)";
+}
+
+// Is the account fully set up (brand + colours + strategy report)? Used to gate
+// content generation — we don't create content before we understand the brand.
+async function checkSetup(userId: string, admin: any): Promise<{ complete: boolean; missing: string[]; brandName: string }> {
+  const safe = async <T>(p: Promise<T>, fb: T): Promise<T> => { try { return await p; } catch { return fb; } };
+  const [profR, brandsR, reportR] = await Promise.all([
+    safe(admin.from("profiles").select("active_brand_id").eq("id", userId).maybeSingle(), { data: null }),
+    safe(admin.from("brand_profiles").select("id,brand_name,primary_colors").eq("user_id", userId), { data: [] }),
+    safe(admin.from("strategy_reports").select("id").eq("user_id", userId).limit(1), { data: [] }),
+  ]);
+  const brands: any[] = (brandsR as any).data || [];
+  const activeId = (profR as any).data?.active_brand_id;
+  const brand = brands.find((b) => b.id === activeId) || brands[0] || null;
+  const hasBrand = !!(brand && brand.brand_name);
+  const hasColors = !!(brand && Array.isArray(brand.primary_colors) && brand.primary_colors.length);
+  const hasReport = (((reportR as any).data) || []).length > 0;
+  const missing: string[] = [];
+  if (!hasBrand) missing.push("a brand profile");
+  if (!hasColors) missing.push("your brand colours");
+  if (!hasReport) missing.push("a competitor/strategy report");
+  return { complete: hasBrand && hasColors && hasReport, missing, brandName: brand?.brand_name || "your brand" };
+}
+
+function looksLikeContentRequest(msg: string): boolean {
+  const m = String(msg).toLowerCase();
+  return /\b(create|generate|make|write|draft|produce|design|launch)\b/.test(m)
+    && /\b(post|content|caption|image|images|video|reel|photo|photos|ad|ads|carousel|story|campaign)\b/.test(m);
+}
+
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
@@ -438,9 +629,6 @@ serve(async (req) => {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
-
-    const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
-    if (!LOVABLE_API_KEY) throw new Error("LOVABLE_API_KEY not configured");
 
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -457,40 +645,183 @@ serve(async (req) => {
       });
     }
 
+    const OPENAI_KEY = await resolveOpenAIKey(user.id);
+    if (!OPENAI_KEY && !hasClaude()) {
+      return new Response(
+        JSON.stringify({ error: "No AI provider configured. Add your OpenAI API key in Account → API Keys." }),
+        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
     const { messages } = await req.json();
+    const latestUserMessage = [...messages].reverse().find((message: any) => message.role === "user")?.content || "";
 
-    const systemPrompt = `You are AIson — an all-in-one AI marketing agent. EVERYTHING happens here in chat. Never tell users to go to another page.
+    // GUARDRAIL: never generate content before we understand the brand.
+    if (typeof latestUserMessage === "string" && looksLikeContentRequest(latestUserMessage)) {
+      const setup = await checkSetup(user.id, supabaseAdmin);
+      if (!setup.complete) {
+        const wantsReport = /\b(a competitor\/strategy report)\b/.test(setup.missing.join(", "));
+        const content = `Before I create content, let's make sure I truly understand **${setup.brandName}** — right now I'm still missing ${setup.missing.join(", ")}.\n\nGreat content comes from knowing your brand, its colours and its competitors — otherwise it's just generic. ${wantsReport ? "Want me to **build your strategy report** now? I'll analyse your brand and real competitors so everything I make is sharp and on-brand." : "Head to the **Brands** page to confirm your brand and colours."} Once that's in place, I'll create content that actually fits **${setup.brandName}**.`;
+        return new Response(JSON.stringify({ content, setup_incomplete: true }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+    }
 
-RULES:
-1. Be SHORT. 2-4 sentences for simple answers.
-2. NEVER use markdown tables. Present data naturally in sentences.
-3. Bold key numbers and names: **5 campaigns**, **3.2%** engagement.
-4. DO actions immediately with tools — never explain what you "would" do.
-5. After an action, confirm in ONE line + suggest one next step.
-6. Skip pleasantries. Just answer.
-7. Write like you're texting a busy CEO.
+    if (typeof latestUserMessage === "string" && isCampaignRequest(latestUserMessage)) {
+      const channel = inferChannelFromPrompt(latestUserMessage);
+      const tone = inferToneFromPrompt(latestUserMessage);
 
-CONTENT GENERATION FLOW:
-When user asks to create content, a post, or a campaign with content:
-1. Use generate_post_content tool immediately with their request
-2. Present the result as a preview:
-   - Show the image using markdown: ![Post preview](image_url)
-   - Show the caption in **bold**
-   - Show hashtags
-   - Show the CTA
-3. Ask: "Want me to **save** this, **schedule** it, or **regenerate** with changes?"
-4. If they approve → use save_creative to save it
-5. If they want to schedule → save first, then use schedule_post
-6. If they want changes → regenerate with updated prompt
+      const campaignResultRaw = await executeTool(
+        "create_campaign",
+        {
+          objective: latestUserMessage,
+          channels: [channel],
+          tone,
+          duration_days: 30,
+          key_offers_or_topics: [latestUserMessage],
+        },
+        user.id,
+        supabaseAdmin,
+      );
+      const campaignResult = safeJsonParse<any>(campaignResultRaw, { error: "Campaign creation failed" });
+      if (campaignResult?.error) {
+        return new Response(JSON.stringify({ error: campaignResult.error }), {
+          status: 500,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
 
-CAMPAIGN FLOW:
-When user asks to launch/create a campaign:
-1. Quickly confirm: channel, tone, objective (ask in ONE message if missing)
-2. Create the campaign with create_campaign
-3. Immediately generate 1-2 sample posts using generate_post_content
-4. Show previews and ask if they want more or want to adjust
+      const sampleResultRaw = await executeTool(
+        "generate_post_content",
+        {
+          prompt: latestUserMessage,
+          tone,
+          channel,
+          campaign_id: campaignResult?.campaign?.id,
+          visual_type: "image",
+        },
+        user.id,
+        supabaseAdmin,
+      );
+      const sampleResult = safeJsonParse<any>(sampleResultRaw, { caption: "", hashtags: [], cta: "", variants: [] });
+      const variants = Array.isArray(sampleResult?.variants) ? sampleResult.variants : [];
+      const hashtags = Array.isArray(sampleResult?.hashtags) ? sampleResult.hashtags.map((tag: string) => tag.startsWith("#") ? tag : `#${tag}`) : [];
+      const variantMarker = variants.length ? `\n\n<<VARIANTS:${JSON.stringify(variants)}>>` : "";
+      const content = [
+        `Campaign created for **${channel}** with a **${tone}** tone.`,
+        sampleResult?.caption ? `\n**Sample caption**\n${sampleResult.caption}` : "",
+        hashtags.length ? `\n${hashtags.join(" ")}` : "",
+        sampleResult?.cta ? `\nCTA: ${sampleResult.cta}` : "",
+        `\nWant me to adjust the angle or generate more options?`,
+        variantMarker,
+      ]
+        .filter(Boolean)
+        .join("\n");
 
-NEVER say "go to Content Studio" or "visit the Dashboard" — do everything here.`;
+      return new Response(JSON.stringify({ content }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    if (typeof latestUserMessage === "string" && isContentGenerationRequest(latestUserMessage)) {
+      const channel = inferChannelFromPrompt(latestUserMessage);
+      const tone = inferToneFromPrompt(latestUserMessage);
+      const visualType = inferVisualType(latestUserMessage);
+
+      const sampleResultRaw = await executeTool(
+        "generate_post_content",
+        {
+          prompt: latestUserMessage,
+          tone,
+          channel,
+          visual_type: visualType,
+        },
+        user.id,
+        supabaseAdmin,
+      );
+      const sampleResult = safeJsonParse<any>(sampleResultRaw, {
+        caption: "",
+        hashtags: [],
+        cta: "",
+        variants: [],
+        error: "Content generation failed",
+      });
+
+      if (sampleResult?.error) {
+        return new Response(JSON.stringify({ error: sampleResult.error }), {
+          status: 500,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
+      const variants = Array.isArray(sampleResult?.variants) ? sampleResult.variants : [];
+      const hashtags = Array.isArray(sampleResult?.hashtags)
+        ? sampleResult.hashtags.map((tag: string) => (tag.startsWith("#") ? tag : `#${tag}`))
+        : [];
+      const variantMarker = variants.length ? `\n\n<<VARIANTS:${JSON.stringify(variants)}>>` : "";
+      const content = [
+        `Here’s a fresh **${channel}** draft in a **${tone}** tone.`,
+        sampleResult?.caption ? `\n**Draft**\n${sampleResult.caption}` : "",
+        hashtags.length ? `\n${hashtags.join(" ")}` : "",
+        sampleResult?.cta ? `\nCTA: ${sampleResult.cta}` : "",
+        "\nWant me to regenerate it, tighten the tone, or save it?",
+        variantMarker,
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      return new Response(JSON.stringify({ content }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    // Ground every answer in the user's real workspace data. Open models call
+    // tools unreliably, so we prefetch a compact snapshot and put it in context.
+    const workspaceSummary = await loadWorkspaceContext(user.id, supabaseAdmin);
+
+    const systemPrompt = `You are AIson — a senior AI marketing strategist and hands-on partner for this business. You are sharp, proactive, and genuinely helpful: you give real advice, explain your reasoning briefly, and help the user think through and structure their marketing. You also DO things directly with your tools (create campaigns, generate content, schedule posts) — you are not just a chatbot.
+
+# WHO YOU'RE HELPING (their live workspace)
+${workspaceSummary}
+
+# HOW YOU OPERATE
+- Be genuinely useful, not curt. Give substantive, specific advice grounded in THIS business's brand, audience, data, and strategy report above — never generic filler. Reference their real brand name, audience, campaigns and numbers.
+- Match depth to the question: a quick data question gets a tight answer; "how do I grow / structure a campaign / what should I post" gets a thoughtful, structured answer with concrete recommendations and a clear rationale.
+- When you give a plan or advice, make it actionable: specific angles, hooks, formats, cadence, CTAs — tailored to their audience and what the strategy report/competitor analysis says works.
+- Be consultative: ask a sharp clarifying question when it materially changes your answer, then proceed. Don't interrogate.
+- Use **bold** for key numbers, names and takeaways, and short bulleted lists for plans.
+
+# SHOWING DATA & STATISTICS (make it visual)
+When the user asks about their numbers/stats/performance, or whenever you present a comparison, breakdown, distribution or trend, render it VISUALLY — never as a wall of numbers:
+- **Charts:** emit a fenced code block tagged \`aison:chart\` containing ONLY JSON:
+  \`\`\`aison:chart
+  {"kind":"donut","title":"Content by type","data":[{"label":"Images","value":8},{"label":"Videos","value":3},{"label":"Text","value":5}]}
+  \`\`\`
+  kind is one of "pie" | "donut" | "bar" | "line" (use pie/donut for shares of a whole, bar for comparisons, line for trends over time). The frontend renders it as a real chart — don't describe the chart in words too.
+- **Tables:** for row/column data (e.g. per-campaign or per-post metrics), use a normal GitHub-flavoured **markdown table** — it now renders as a styled table.
+- Only ever chart/tabulate REAL numbers from the workspace context or your tools. Never invent data. If you don't have the numbers, say so and offer to build the report.
+- Add one short sentence of insight above the chart/table (what it means / what to do).
+- After showing stats, tell them they can tap **"Open full analytics"** for the complete breakdown.
+- You can reference their marketing strategy report (competitor patterns to emulate, gaps to exploit, recommended angles/hooks/CTAs). If they don't have one yet, offer to build it — it makes every campaign smarter.
+
+# GUARDRAILS — don't generate blind
+- Only generate polished content when SETUP STATUS is COMPLETE (brand + colours + strategy report). If it's INCOMPLETE, don't dump content — instead warmly explain that you'll make far better content once you understand their brand, and help them finish the missing pieces (confirm brand + colours on the Brands page, build the strategy report). Offer to do those steps now.
+- Once setup is complete, generate confidently and on-brand.
+
+# PROPOSING CONTENT (not prompts)
+- When you create content, PROPOSE the finished content — caption, hooks, hashtags, CTA, and a short note on the visual idea. Do NOT show the long internal image/video generation prompt; it's for the generator, not the user. Only reveal the raw prompt if the user explicitly asks ("show me the prompt").
+- Keep proposals scannable and offer clear next steps (save / schedule / regenerate / tweak).
+
+# TAKING ACTION (use tools, don't just talk)
+- To create a campaign: confirm channel/tone/objective in one message if missing, then use create_campaign, then offer to generate sample posts.
+- To create content/a post: use generate_post_content, present caption + hashtags + CTA (and image if returned), then offer to save/schedule/regenerate. Note: images/videos generate asynchronously and appear in the user's Library — tell them that rather than claiming an image is shown if none is returned.
+- To save → save_creative. To schedule → save then schedule_post. To update business/brand info → update_company.
+- After an action, confirm in one line and suggest the best next step.
+- Everything happens here in chat — never tell the user to "go to another page". If something lives on a page (Library, Brands), reference it naturally but still do the work here.
+
+# STYLE
+Warm, confident, concise-but-complete. You sound like an experienced marketer who knows this brand well and wants it to win.`;
 
     // Build messages for the AI
     const aiMessages = [
@@ -499,18 +830,7 @@ NEVER say "go to Content Studio" or "visit the Dashboard" — do everything here
     ];
 
     // First AI call (may request tool calls)
-    let response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${LOVABLE_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "google/gemini-3-flash-preview",
-        messages: aiMessages,
-        tools,
-      }),
-    });
+    let response = await chatAI({ messages: aiMessages, tools }, OPENAI_KEY);
 
     if (!response.ok) {
       const status = response.status;
@@ -559,18 +879,7 @@ NEVER say "go to Content Studio" or "visit the Dashboard" — do everything here
       aiMessages.push(...toolResults);
 
       // Call AI again with tool results
-      response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${LOVABLE_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: "google/gemini-3-flash-preview",
-          messages: aiMessages,
-          tools,
-        }),
-      });
+      response = await chatAI({ messages: aiMessages, tools }, OPENAI_KEY);
 
       if (!response.ok) {
         console.error(`AI gateway error on tool round ${rounds}: ${response.status}`);

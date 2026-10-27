@@ -15,11 +15,20 @@ export default function Signup() {
   const [errors, setErrors] = useState<Record<string, string>>({});
 
   useEffect(() => {
+    // Route new sign-ups to onboarding; already-set-up users go to the app.
+    const routeAfterAuth = async (userId: string) => {
+      try {
+        const { data } = await supabase.from("brand_profiles").select("id").eq("user_id", userId).limit(1);
+        navigate(data && data.length ? "/home" : "/onboarding");
+      } catch {
+        navigate("/onboarding");
+      }
+    };
     supabase.auth.getSession().then(({ data: { session } }) => {
-      if (session) navigate("/content-studio");
+      if (session) routeAfterAuth(session.user.id);
     });
     const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
-      if (session && event === "SIGNED_IN") navigate("/content-studio");
+      if (session && event === "SIGNED_IN") routeAfterAuth(session.user.id);
     });
     return () => subscription.unsubscribe();
   }, [navigate]);
@@ -43,7 +52,7 @@ export default function Signup() {
         password,
         options: {
           data: { full_name: fullName.trim(), company_name: company.trim() },
-          emailRedirectTo: `${window.location.origin}/content-studio`,
+          emailRedirectTo: `${window.location.origin}/onboarding`,
         },
       });
       if (error) {
@@ -53,7 +62,7 @@ export default function Signup() {
           toast.error(error.message);
         }
       } else {
-        toast.success("Account created! Check your email to verify.");
+        toast.success("Account created! You're signed in.");
       }
     } catch {
       toast.error("Something went wrong. Please try again.");
@@ -112,7 +121,7 @@ export default function Signup() {
 
         <p className="text-[#9CA3AF] text-sm mt-6 max-w-md text-center">
           Already have an account?{" "}
-          <button onClick={() => navigate("/auth")} className="text-[#F97316] hover:underline font-medium">Log in</button>
+          <button onClick={() => navigate("/auth?mode=login")} className="text-[#F97316] hover:underline font-medium">Log in</button>
         </p>
 
         <p className="text-gray-500 text-xs mt-8 max-w-md text-center">

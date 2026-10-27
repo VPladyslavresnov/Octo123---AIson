@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
-import { Heart, Image as ImageIcon, FileText, Video, Trash2, ExternalLink, Calendar, Clock, Sparkles } from "lucide-react";
+import { Heart, Image as ImageIcon, FileText, Video, Trash2, ExternalLink, Calendar, Clock, Sparkles, Instagram, Loader2 } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
@@ -9,6 +9,8 @@ import { Badge } from "@/components/ui/badge";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { getMetaManualConnection, publishImageToInstagram } from "@/lib/metaLocalConnector";
+import { getBypassRedirectTarget, shouldBypassAuth } from "@/lib/localAccessBypass";
 
 interface SavedCreative {
   id: string;
@@ -16,6 +18,7 @@ interface SavedCreative {
   visual_url: string | null;
   caption: string | null;
   alt_text: string | null;
+  hashtags?: string[] | null;
   created_at: string;
   campaign_id: string | null;
   campaign?: {
@@ -36,6 +39,7 @@ export default function Library() {
   const [scheduledTime, setScheduledTime] = useState("");
   const [socialConnections, setSocialConnections] = useState<any[]>([]);
   const [selectedPlatforms, setSelectedPlatforms] = useState<string[]>([]);
+  const [publishingCreativeId, setPublishingCreativeId] = useState<string | null>(null);
 
   useEffect(() => {
     checkAuth();
@@ -44,7 +48,13 @@ export default function Library() {
   const checkAuth = async () => {
     const { data: { session } } = await supabase.auth.getSession();
     if (!session) {
-      navigate("/auth");
+      if (shouldBypassAuth()) {
+        setLoading(false);
+        setCreatives([]);
+        setSocialConnections([]);
+        return;
+      }
+      navigate(getBypassRedirectTarget());
       return;
     }
     loadSavedCreatives();
@@ -54,7 +64,10 @@ export default function Library() {
   const loadSocialConnections = async () => {
     try {
       const { data: { user } } = await supabase.auth.getUser();
-      if (!user) return;
+      if (!user) {
+        setSocialConnections([]);
+        return;
+      }
 
       const { data, error } = await supabase
         .from("social_connections_safe" as any)
@@ -70,7 +83,10 @@ export default function Library() {
   const loadSavedCreatives = async () => {
     try {
       const { data: { user } } = await supabase.auth.getUser();
-      if (!user) return;
+      if (!user) {
+        setCreatives([]);
+        return;
+      }
 
       const { data, error } = await supabase
         .from("creatives")
@@ -174,6 +190,90 @@ export default function Library() {
     } catch (error: any) {
       toast.error("Failed to schedule post: " + error.message);
     }
+  };
+
+  const publishToInstagram = async (creative: SavedCreative) => {
+    const manualMetaConnection = getMetaManualConnection();
+    const instagramConnection = socialConnections.find((connection) => connection.platform === "instagram") || manualMetaConnection;
+    if (!instagramConnection) {
+      toast.error("Connect Instagram first");
+      navigate("/posting");
+      return;
+    }
+    if (creative.content_type !== "image" || !creative.visual_url) {
+      toast.error("Instagram direct publishing currently supports saved image creatives.");
+      return;
+    }
+    if (!/^https?:\/\//i.test(creative.visual_url)) {
+      if (!creative.visual_url.startsWith("data:image/")) {
+        toast.error("Meta requires the image to be hosted at a public URL before publishing.");
+        return;
+      }
+    }
+
+    setPublishingCreativeId(creative.id);
+    try {
+      const publicImageUrl = await ensurePublicImageUrl(creative);
+
+      if (manualMetaConnection) {
+        await publishImageToInstagram({
+          connection: manualMetaConnection,
+          imageUrl: publicImageUrl,
+          caption: creative.caption,
+          hashtags: creative.hashtags,
+        });
+        toast.success("Published to Instagram");
+        return;
+      }
+
+      const { data, error } = await supabase.functions.invoke("instagram-post", {
+        body: { creativeId: creative.id },
+      });
+
+      if (error) throw error;
+      if (data?.error) throw new Error(data.error);
+
+      toast.success("Published to Instagram");
+    } catch (error: any) {
+      toast.error(error.message || "Failed to publish to Instagram");
+    } finally {
+      setPublishingCreativeId(null);
+    }
+  };
+
+  const ensurePublicImageUrl = async (creative: SavedCreative): Promise<string> => {
+    if (!creative.visual_url) throw new Error("Creative has no image.");
+    if (/^https?:\/\//i.test(creative.visual_url)) return creative.visual_url;
+    if (!creative.visual_url.startsWith("data:image/")) {
+      throw new Error("This image format cannot be published to Instagram.");
+    }
+
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) throw new Error("Please sign in before publishing.");
+
+    const response = await fetch(creative.visual_url);
+    const blob = await response.blob();
+    const extension = blob.type.includes("jpeg") ? "jpg" : "png";
+    const path = `${user.id}/instagram-publish/${creative.id}-${Date.now()}.${extension}`;
+
+    const { error } = await supabase.storage
+      .from("brand-assets")
+      .upload(path, blob, {
+        contentType: blob.type || "image/png",
+        upsert: true,
+      });
+
+    if (error) throw error;
+
+    const { data } = supabase.storage.from("brand-assets").getPublicUrl(path);
+    const publicUrl = data.publicUrl;
+
+    await supabase
+      .from("creatives")
+      .update({ visual_url: publicUrl })
+      .eq("id", creative.id);
+
+    return publicUrl;
   };
 
   const togglePlatform = (platform: string) => {
@@ -371,6 +471,21 @@ export default function Library() {
                   )}
 
                   <div className="flex gap-2 flex-wrap" onClick={(e) => e.stopPropagation()}>
+                    {creative.content_type === "image" && (
+                      <Button
+                        size="sm"
+                        onClick={() => publishToInstagram(creative)}
+                        disabled={publishingCreativeId === creative.id}
+                        className="gap-1.5"
+                      >
+                        {publishingCreativeId === creative.id ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <Instagram className="w-3.5 h-3.5" />
+                        )}
+                        Publish
+                      </Button>
+                    )}
                     <Button size="sm" variant="outline" onClick={() => navigate("/campaigns")}>
                       Add to Campaign
                     </Button>
@@ -439,6 +554,20 @@ export default function Library() {
                   Saved {new Date(previewCreative.created_at).toLocaleDateString()}
                 </p>
                 <div className="flex gap-2 pt-2">
+                  {previewCreative.content_type === "image" && (
+                    <Button
+                      size="sm"
+                      onClick={() => publishToInstagram(previewCreative)}
+                      disabled={publishingCreativeId === previewCreative.id}
+                    >
+                      {publishingCreativeId === previewCreative.id ? (
+                        <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                      ) : (
+                        <Instagram className="w-4 h-4 mr-2" />
+                      )}
+                      Publish to Instagram
+                    </Button>
+                  )}
                   <Button size="sm" onClick={() => { openScheduleModal(previewCreative); setPreviewCreative(null); }}>
                     <Calendar className="w-4 h-4 mr-2" /> Schedule
                   </Button>

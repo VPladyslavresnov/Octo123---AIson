@@ -1,11 +1,13 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.7.1";
+import { claudeChatCompletion, hasClaude } from "../_shared/claude.ts";
+import { noProviderResponse, openaiChatCompletion, resolveOpenAIKey } from "../_shared/openai.ts";
 
 const DEFAULT_MODEL = "openai/gpt-5";
 const OPENAI_FALLBACK_MODEL = "gpt-4o-mini";
 
 // Models that exist on api.openai.com and can be called directly
-const DIRECT_OPENAI_MODELS = new Set(["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"]);
+const DIRECT_OPENAI_MODELS = new Set<string>(); // routed through shared provider (Groq/Llama)
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -35,6 +37,8 @@ function getProviderErrorMessage(errorText: string): string | null {
     if (parsed?.error?.message && typeof parsed.error.message === "string") {
       return parsed.error.message;
     }
+    if (typeof parsed?.error === "string") return parsed.error;
+    if (typeof parsed?.message === "string") return parsed.message;
   } catch {
     // ignore JSON parse errors
   }
@@ -123,10 +127,24 @@ async function callAI(
   prompt: string,
   systemPrompt: string,
   model: string,
-  lovableKey: string,
   openaiKey: string | null,
 ) {
   const normalizedModel = normalizeModel(model);
+
+  // All AI chat/text goes through Claude when configured
+  if (hasClaude()) {
+    console.log("Using Anthropic Claude");
+    const claudeResponse = await claudeChatCompletion({
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: prompt },
+      ],
+    });
+    if (claudeResponse.ok) {
+      return { source: "claude" as const, response: claudeResponse };
+    }
+    console.warn("Claude failed, falling back:", claudeResponse.status, await claudeResponse.clone().text());
+  }
 
   // Try xAI (Grok) first if key is available
   const xaiKey = Deno.env.get("XAI_API_KEY");
@@ -167,22 +185,19 @@ async function callAI(
     return { source: "openai" as const, response };
   }
 
-  console.log("Using Lovable AI Gateway with model:", normalizedModel);
-  const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${lovableKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: normalizedModel || DEFAULT_MODEL,
+  if (openaiKey) {
+    console.log("Using OpenAI with model:", normalizedModel);
+    const response = await openaiChatCompletion(openaiKey, {
+      model: normalizedModel,
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: prompt },
       ],
-    }),
-  });
-  return { source: "gateway" as const, response };
+    });
+    return { source: "openai" as const, response };
+  }
+
+  return { source: "none" as const, response: noProviderResponse() };
 }
 
 serve(async (req) => {
@@ -201,10 +216,8 @@ serve(async (req) => {
 
     const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
     const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY");
-    const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
-    const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY");
 
-    if (!LOVABLE_API_KEY || !SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
       console.error("Missing required environment variables");
       return new Response(JSON.stringify({ error: "Service temporarily unavailable" }), {
         status: 500,
@@ -237,15 +250,8 @@ serve(async (req) => {
       });
     }
 
-    const sanitizedPrompt = prompt.trim().slice(0, 5000);
+    const sanitizedPrompt = prompt.trim().slice(0, 22000);
     const selectedModel = normalizeModel(preferredModel);
-
-    if (isDirectOpenAIModel(selectedModel) && !OPENAI_API_KEY) {
-      return new Response(JSON.stringify({ error: "OpenAI is not configured on this backend yet." }), {
-        status: 500,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
 
     let systemPrompt = clientSystemPrompt || "";
 
@@ -281,8 +287,14 @@ serve(async (req) => {
 
     console.log("Generating text for user:", userId, "model:", selectedModel);
 
-    const result = await callAI(enrichedPrompt, systemPrompt, selectedModel, LOVABLE_API_KEY, OPENAI_API_KEY || null);
+    const OPENAI_API_KEY = await resolveOpenAIKey(userId);
+    const result = await callAI(enrichedPrompt, systemPrompt, selectedModel, OPENAI_API_KEY);
     const response = result.response;
+
+    // No AI provider configured → return the clear message as-is.
+    if (result.source === "none") {
+      return response;
+    }
 
     if (!response.ok) {
       const errorText = await response.text();

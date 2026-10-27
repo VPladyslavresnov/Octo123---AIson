@@ -1,0 +1,14 @@
+services:
+  aison-web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VITE_SUPABASE_URL: ${VITE_SUPABASE_URL}
+        VITE_SUPABASE_PUBLISHABLE_KEY: ${VITE_SUPABASE_PUBLISHABLE_KEY}
+        VITE_SUPABASE_PROJECT_ID: ${VITE_SUPABASE_PROJECT_ID}
+        VITE_VARG_API_KEY: ${VITE_VARG_API_KEY}
+    container_name: aison-web
+    restart: unless-stopped
+    ports:
+      - "8080:80"

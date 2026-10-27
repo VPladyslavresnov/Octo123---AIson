@@ -226,6 +226,9 @@ export type Database = {
       }
       company_details: {
         Row: {
+          assistant_voice: string | null
+          assistant_voice_enabled: boolean | null
+          assistant_voice_speed: number | null
           brand_colors: Json | null
           brand_source_url: string | null
           business_type: string | null
@@ -240,6 +243,9 @@ export type Database = {
           website: string | null
         }
         Insert: {
+          assistant_voice?: string | null
+          assistant_voice_enabled?: boolean | null
+          assistant_voice_speed?: number | null
           brand_colors?: Json | null
           brand_source_url?: string | null
           business_type?: string | null
@@ -254,6 +260,9 @@ export type Database = {
           website?: string | null
         }
         Update: {
+          assistant_voice?: string | null
+          assistant_voice_enabled?: boolean | null
+          assistant_voice_speed?: number | null
           brand_colors?: Json | null
           brand_source_url?: string | null
           business_type?: string | null
@@ -507,7 +516,12 @@ export type Database = {
           connected_at: string | null
           default_schedule: Json | null
           id: string
+          metadata: Json | null
+          page_id: string | null
           platform: string
+          platform_account_id: string | null
+          scopes: string[] | null
+          token_expires_at: string | null
           user_id: string
         }
         Insert: {
@@ -517,7 +531,12 @@ export type Database = {
           connected_at?: string | null
           default_schedule?: Json | null
           id?: string
+          metadata?: Json | null
+          page_id?: string | null
           platform: string
+          platform_account_id?: string | null
+          scopes?: string[] | null
+          token_expires_at?: string | null
           user_id: string
         }
         Update: {
@@ -527,7 +546,12 @@ export type Database = {
           connected_at?: string | null
           default_schedule?: Json | null
           id?: string
+          metadata?: Json | null
+          page_id?: string | null
           platform?: string
+          platform_account_id?: string | null
+          scopes?: string[] | null
+          token_expires_at?: string | null
           user_id?: string
         }
         Relationships: []
@@ -621,7 +645,12 @@ export type Database = {
           connected_at: string | null
           default_schedule: Json | null
           id: string | null
+          metadata: Json | null
+          page_id: string | null
           platform: string | null
+          platform_account_id: string | null
+          scopes: string[] | null
+          token_expires_at: string | null
           user_id: string | null
         }
         Insert: {
@@ -630,7 +659,12 @@ export type Database = {
           connected_at?: string | null
           default_schedule?: Json | null
           id?: string | null
+          metadata?: Json | null
+          page_id?: string | null
           platform?: string | null
+          platform_account_id?: string | null
+          scopes?: string[] | null
+          token_expires_at?: string | null
           user_id?: string | null
         }
         Update: {
@@ -639,7 +673,12 @@ export type Database = {
           connected_at?: string | null
           default_schedule?: Json | null
           id?: string | null
+          metadata?: Json | null
+          page_id?: string | null
           platform?: string | null
+          platform_account_id?: string | null
+          scopes?: string[] | null
+          token_expires_at?: string | null
           user_id?: string | null
         }
         Relationships: []

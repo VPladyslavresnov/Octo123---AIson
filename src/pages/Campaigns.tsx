@@ -8,6 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { Megaphone, Plus, Search, SlidersHorizontal } from "lucide-react";
 import { toast } from "sonner";
 import { CampaignMenu } from "@/components/campaign/CampaignMenu";
+import { getBypassRedirectTarget, shouldBypassAuth } from "@/lib/localAccessBypass";
 
 type CampaignRow = {
   id: string;
@@ -20,6 +21,7 @@ type CampaignRow = {
   created_at: string | null;
   content_mix: {
     goal?: string;
+    campaignName?: string;
   } | null;
 };
 
@@ -37,8 +39,10 @@ export default function Campaigns() {
   const checkAuthAndLoadCampaigns = async () => {
     const { data: { session } } = await supabase.auth.getSession();
     if (!session) {
-      navigate("/auth");
-      return;
+      if (!shouldBypassAuth()) {
+        navigate(getBypassRedirectTarget());
+        return;
+      }
     }
     loadCampaigns();
   };
@@ -63,6 +67,7 @@ export default function Campaigns() {
     return campaigns.filter((campaign) => {
       const matchesSearch =
         !search.trim() ||
+        (campaign.content_mix?.campaignName || "").toLowerCase().includes(search.toLowerCase()) ||
         (campaign.objective || "").toLowerCase().includes(search.toLowerCase()) ||
         (campaign.content_mix?.goal || "").toLowerCase().includes(search.toLowerCase());
 
@@ -188,7 +193,7 @@ export default function Campaigns() {
                     >
                       <td className="px-4 py-4">
                         <div>
-                          <p className="font-medium text-foreground">{campaign.objective || "Untitled campaign"}</p>
+                          <p className="font-medium text-foreground">{campaign.content_mix?.campaignName || campaign.objective || "Untitled campaign"}</p>
                           <p className="text-sm text-muted-foreground mt-1 capitalize">
                             {campaign.tone || "Professional"} tone
                           </p>

@@ -1,12 +1,15 @@
 import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { AppSidebar } from "@/components/AppSidebar";
 import { FloatingAssistant } from "@/components/FloatingAssistant";
+import { RewardsEngine } from "@/components/RewardsEngine";
 import { ParticleField } from "@/components/home/ParticleField";
 import { Outlet } from "react-router-dom";
 
 export function AppLayout() {
   return (
     <SidebarProvider>
+      {/* Loyalty gamification: records daily login + awards event-based stars */}
+      <RewardsEngine />
       <div className="min-h-screen flex w-full">
         <AppSidebar />
         <div className="flex-1 flex flex-col min-w-0 relative">

@@ -1,3 +1,5 @@
+import { claudeChatCompletion, hasClaude } from "../_shared/claude.ts";
+import { openaiChatCompletion, resolveOpenAIKey } from "../_shared/openai.ts";
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
@@ -43,12 +45,12 @@ Deno.serve(async (req) => {
 
     const firecrawlApiKey = Deno.env.get('FIRECRAWL_API_KEY');
     
-    // If Firecrawl is not configured, use Lovable AI to analyze the brand
+    // If Firecrawl is not configured, use AI to analyze the brand
     if (!firecrawlApiKey) {
       console.log('Firecrawl not configured, using AI analysis');
-      
-      const lovableApiKey = Deno.env.get('LOVABLE_API_KEY');
-      if (!lovableApiKey) {
+
+      const openaiKey = await resolveOpenAIKey(null);
+      if (!openaiKey && !hasClaude()) {
         return new Response(
           JSON.stringify({
             extractionSuccess: false,
@@ -62,13 +64,7 @@ Deno.serve(async (req) => {
       // Use AI to generate brand-appropriate colors based on the URL/domain
       const domain = new URL(formattedUrl).hostname;
       
-      const aiResponse = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${lovableApiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
+      const aiBody = {
           model: 'google/gemini-2.5-flash',
           messages: [
             {
@@ -79,8 +75,12 @@ Deno.serve(async (req) => {
 Consider the industry/type of business the domain name suggests. Use professional, modern color palettes.`
             }
           ]
-        })
-      });
+      };
+
+      // Claude when configured, otherwise OpenAI
+      const aiResponse = hasClaude()
+        ? await claudeChatCompletion({ messages: aiBody.messages, response_format: { type: "json_object" } })
+        : await openaiChatCompletion(openaiKey!, { messages: aiBody.messages, response_format: { type: "json_object" } });
 
       if (!aiResponse.ok) {
         return new Response(
